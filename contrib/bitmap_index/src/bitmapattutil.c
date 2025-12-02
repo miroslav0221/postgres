@@ -94,3 +94,16 @@ _bitmap_findvalue(Relation lovHeap, Relation lovIndex,
 
 	return found;
 }
+
+/*
+ * _bitmap_open_lov_heapandindex() -- open the heap relation and the btree
+ *		index for LOV.
+ */
+void
+_bitmap_open_lov_heapandindex(Relation rel pg_attribute_unused(), BMMetaPage metapage,
+                              Relation *lovHeapP, Relation *lovIndexP,
+                              LOCKMODE lockMode)
+{
+    *lovHeapP = heap_open(metapage->bm_lov_heapId, lockMode);
+    *lovIndexP = index_open(metapage->bm_lov_indexId, lockMode);
+}
