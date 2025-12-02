@@ -107,3 +107,14 @@ _bitmap_open_lov_heapandindex(Relation rel pg_attribute_unused(), BMMetaPage met
     *lovHeapP = heap_open(metapage->bm_lov_heapId, lockMode);
     *lovIndexP = index_open(metapage->bm_lov_indexId, lockMode);
 }
+
+/*
+ * _bitmap_close_lov_heapandindex() -- close the heap and the index.
+ */
+void
+_bitmap_close_lov_heapandindex(Relation lovHeap, Relation lovIndex,
+                               LOCKMODE lockMode)
+{
+    heap_close(lovHeap, lockMode);
+    index_close(lovIndex, lockMode);
+}
