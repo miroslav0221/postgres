@@ -43,7 +43,7 @@
 #include "nodes/makefuncs.h"
 #include "optimizer/clauses.h"
 #include "utils/builtins.h"
-#include "utils/faultinjector.h"
+//#include "utils/faultinjector.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 #include "utils/snapmgr.h"
