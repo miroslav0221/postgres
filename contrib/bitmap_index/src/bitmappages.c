@@ -436,3 +436,17 @@ _bitmap_init(Relation indexrel, bool use_wal, bool for_empty)
 
 	pfree(lovItem);
 }
+
+/*
+ * _bitmap_init_lovpage -- initialize a new LOV page.
+ */
+void
+_bitmap_init_lovpage(Relation rel pg_attribute_unused(), Buffer buf)
+{
+    Page			page;
+
+    page = (Page) BufferGetPage(buf);
+
+    if(PageIsNew(page))
+        PageInit(page, BufferGetPageSize(buf), 0);
+}

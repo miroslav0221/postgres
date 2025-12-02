@@ -118,3 +118,54 @@ _bitmap_close_lov_heapandindex(Relation lovHeap, Relation lovIndex,
     heap_close(lovHeap, lockMode);
     index_close(lovIndex, lockMode);
 }
+
+/*
+ * _bitmap_insert_lov() -- insert a new data into the given heap and index.
+ */
+void
+_bitmap_insert_lov(Relation lovHeap, Relation lovIndex, Datum *datum,
+                   bool *nulls, bool use_wal pg_attribute_unused())
+{
+    TupleDesc	tupDesc;
+    HeapTuple	tuple;
+    bool		result;
+    Datum	   *indexDatum;
+    bool	   *indexNulls;
+
+    tupDesc = RelationGetDescr(lovHeap);
+
+    /* insert this tuple into the heap */
+    tuple = heap_form_tuple(tupDesc, datum, nulls);
+    simple_heap_insert(lovHeap, tuple);
+
+    /* insert a new tuple into the index */
+    indexDatum = palloc0((tupDesc->natts - 2) * sizeof(Datum));
+    indexNulls = palloc0((tupDesc->natts - 2) * sizeof(bool));
+    memcpy(indexDatum, datum, (tupDesc->natts - 2) * sizeof(Datum));
+    memcpy(indexNulls, nulls, (tupDesc->natts - 2) * sizeof(bool));
+    result = index_insert(lovIndex, indexDatum, indexNulls,
+                          &(tuple->t_self), lovHeap, true, false, NULL);
+
+#ifdef FAULT_INJECTOR
+    FaultInjector_InjectFaultIfSet(
+							"insert_bmlov_before_freeze",
+							DDLNotSpecified,
+							"", //databaseName
+							RelationGetRelationName(lovHeap));
+#endif
+    /* freeze the tuple */
+    heap_freeze_tuple_wal_logged(lovHeap, tuple);
+
+#ifdef FAULT_INJECTOR
+    FaultInjector_InjectFaultIfSet(
+							"insert_bmlov_after_freeze",
+							DDLNotSpecified,
+							"", //databaseName
+							RelationGetRelationName(lovHeap));
+#endif
+    pfree(indexDatum);
+    pfree(indexNulls);
+    Assert(result);
+
+    heap_freetuple(tuple);
+}
