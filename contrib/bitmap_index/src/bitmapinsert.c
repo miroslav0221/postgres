@@ -23,7 +23,6 @@
 #include "access/heapam.h"
 #include "bitmap.h"
 #include "bitmap_private.h"
-#include "access/bitmap_xlog.h"
 #include "access/transam.h"
 #include "parser/parse_oper.h"
 #include "storage/bufmgr.h"
@@ -33,6 +32,19 @@
 #include "utils/lsyscache.h"
 #include "utils/snapmgr.h"
 #include "utils/faultinjector.h"
+
+/*
+ * BMTIDLOVBuffer represents those bitmap vectors whose LOV item would be
+ * stored on the specified lov_block. The array bufs stores the TIDs for
+ * a distinct vector (see above). The index of the array we're up to tell
+ * us the offset number of the LOV item on the lov_block.
+ */
+
+typedef struct BMTIDLOVBuffer
+{
+    BlockNumber lov_block;
+    BMTIDBuffer *bufs[BM_MAX_LOVITEMS_PER_PAGE];
+} BMTIDLOVBuffer;
 
 /*
  * _bitmap_buildinsert() -- insert an index tuple during index creation.
