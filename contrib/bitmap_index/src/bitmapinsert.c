@@ -23,6 +23,7 @@
 #include "access/heapam.h"
 #include "bitmap.h"
 #include "bitmap_private.h"
+#include "bitmap_xlog.h"
 #include "access/transam.h"
 #include "parser/parse_oper.h"
 #include "storage/bufmgr.h"
@@ -47,10 +48,14 @@ typedef struct BMTIDLOVBuffer
 } BMTIDLOVBuffer;
 
 
+
 static void _bitmap_write_new_bitmapwords(Relation rel,
 							  Buffer lovBuffer, OffsetNumber lovOffset,
 							  BMTIDBuffer* buf, bool use_wal);
 
+static uint64 _bitmap_write_bitmapwords_on_page(Page bitmapPage,
+								  BMTIDBuffer *buf, int startWordNo,
+								  xl_bm_bitmapwords_perpage *xlrec_perpage);
 static uint16 buf_extend(BMTIDBuffer *buf);
 
 static void build_inserttuple(Relation rel, uint64 tidnum,
@@ -60,8 +65,22 @@ static void build_inserttuple(Relation rel, uint64 tidnum,
 static uint16 buf_ensure_head_space(Relation rel, BMTIDBuffer *buf,
 								   Buffer lovBuffer, OffsetNumber off,
 								   bool use_wal);
-                                   
+                              
 								   
+static void inserttuple(Relation rel, Buffer metabuf, 
+								uint64 tidnum, ItemPointerData ht_ctid, 
+							    TupleDesc tupDesc, Datum* attdata,
+							    bool *nulls, Relation lovHeap, 
+								Relation lovIndex, ScanKey scanKey, 
+								IndexScanDesc scanDesc, bool use_wal); 
+						
+								
+static void create_lovitem(Relation rel, Buffer metabuf, uint64 tidnum, 
+						   TupleDesc tupDesc, 
+						   Datum *attdata, bool *nulls,
+						   Relation lovHeap, Relation lovIndex,
+						   BlockNumber *lovBlockP, 
+						   OffsetNumber *lovOffsetP, bool use_wal);
 static uint16 _bitmap_free_tidbuf(BMTIDBuffer* buf);
 static void updatesetbit(Relation rel, 
 						 Buffer lovBuffer, OffsetNumber lovOffset,
@@ -75,6 +94,34 @@ static void updatesetbit_inpage(Relation rel, uint64 tidnum,
 static void insertsetbit(Relation rel, BlockNumber lovBlock, OffsetNumber lovOffset,
 			 			 uint64 tidnum, BMTIDBuffer *buf, bool use_wal);
 
+static void buf_make_space(Relation rel,
+					  BMTidBuildBuf *tidLocsBuffer, bool use_wal);
+
+static uint16 buf_free_mem_block(Relation rel, BMTIDBuffer *buf,
+			  			         Buffer lovBuffer, OffsetNumber off,
+						         bool use_wal);
+static uint16 buf_free_mem(Relation rel, BMTIDBuffer *buf,
+			  			   BlockNumber lov_block, OffsetNumber off, 
+						   bool use_wal);
+static void shift_header_bits(BM_HRL_WORD *words, uint32 numOfBits,
+						  uint32 maxNumOfWords, uint32 startLoc,
+						  uint32 numOfShiftingBits);
+static void rshift_header_bits(BM_HRL_WORD *words, uint64 nwords,
+							   uint32 bits);
+static void lshift_header_bits(BM_HRL_WORD *words, uint64 nwords,
+							   uint32 bits);
+static void insert_newwords(BMTIDBuffer* words, uint32 insertPos,
+							BMTIDBuffer* new_words, BMTIDBuffer* words_left);
+static int16 mergewords(BMTIDBuffer* buf, bool lastWordFill);
+
+static void findbitmappage(Relation rel, BMLOVItem lovitem,
+					   uint64 tidnum,
+					   Buffer *bitmapBufferP, uint64 *firstTidNumberP);
+
+static int16 buf_add_tid_with_fill(Relation rel, BMTIDBuffer *buf,
+								   Buffer lovBuffer, OffsetNumber off,
+								   uint64 tidnum, bool use_wal);
+static uint16 _bitmap_free_tidbuf(BMTIDBuffer* buf);
 
 #define BUF_INIT_WORDS 8 /* as good a point as any */
    
@@ -406,6 +453,7 @@ buf_add_tid(Relation rel, BMTidBuildBuf *tids, uint64 tidnum,
 		bytes_added = buf_extend(buf);
 
 		buf->curword = 0;
+		
 
 		buf_add_tid_with_fill(rel, buf, lovbuf, off, tidnum, state->use_wal);
 
@@ -1172,4 +1220,1204 @@ updatesetbit(Relation rel, Buffer lovBuffer, OffsetNumber lovOffset,
 
 	// if (Debug_bitmap_print_insert)
 	// 	verify_bitmappages(rel, lovItem);
+}
+
+
+/*
+ * updatesetbit_inword() -- update the given bit to 1 in a given
+ * 	word.
+ *
+ * The given word will generate at most three new words, depending on 
+ * the position of the given bit to be updated. Make sure that the 
+ * array 'words' has the size of 3 when you call this function. All new 
+ * words will be put in this array, and the final number of new words is 
+ * stored in '*numWordsP'. The bit location 'updateBitLoc' is relative to
+ * the beginning of the given word, starting from 0.
+ *
+ * We assume that word is a fill zero word.
+ */
+static void
+updatesetbit_inword(BM_HRL_WORD word, uint64 updateBitLoc,
+					uint64 firstTid, BMTIDBuffer *buf)
+{
+	uint64	numBits, usedNumBits;
+	uint16	insertingPos;
+
+	Assert(updateBitLoc < BM_HRL_WORD_SIZE*FILL_LENGTH(word));
+
+	numBits = FILL_LENGTH(word) * BM_HRL_WORD_SIZE;
+	usedNumBits = 0;
+	if (updateBitLoc >= BM_HRL_WORD_SIZE)
+	{
+		firstTid += (updateBitLoc/BM_HRL_WORD_SIZE) * BM_HRL_WORD_SIZE;
+		buf->cwords[buf->curword] =
+			BM_MAKE_FILL_WORD(0, updateBitLoc/BM_HRL_WORD_SIZE);
+		buf->last_tids[buf->curword] = firstTid - 1;
+		buf->curword++;
+		buf_extend(buf);
+		buf->hwords[(buf->curword-1)/BM_HRL_WORD_SIZE] |=
+			(((BM_HRL_WORD)1)<<(BM_HRL_WORD_SIZE - buf->curword));
+		usedNumBits += (updateBitLoc/BM_HRL_WORD_SIZE) * BM_HRL_WORD_SIZE;
+	}
+
+	/* construct the literal word */
+	insertingPos = updateBitLoc - usedNumBits;
+	firstTid += BM_HRL_WORD_SIZE;
+	buf->cwords[buf->curword] =
+		((BM_HRL_WORD)0) | (((BM_HRL_WORD)1) << insertingPos);
+	buf->last_tids[buf->curword] = firstTid - 1;
+	buf->curword++;
+	buf_extend(buf);
+	usedNumBits += BM_HRL_WORD_SIZE;
+
+	if (numBits > usedNumBits)
+	{
+		BM_HRL_WORD fill_length;
+		Assert((numBits - usedNumBits) % BM_HRL_WORD_SIZE == 0);
+		fill_length = (numBits - usedNumBits) / BM_HRL_WORD_SIZE;
+
+		firstTid += fill_length * BM_HRL_WORD_SIZE;
+		buf->cwords[buf->curword] = BM_MAKE_FILL_WORD(0, fill_length);
+		buf->last_tids[buf->curword] = firstTid -1;
+		buf->curword++;
+		buf_extend(buf);
+		buf->hwords[(buf->curword-1)/BM_HRL_WORD_SIZE] |=
+			(((BM_HRL_WORD)1) << (BM_HRL_WORD_SIZE - buf->curword));
+	}
+}
+
+/*
+ * updatesetbit_inpage() -- update the given bit to 1 in a given
+ *	bitmap page.
+ *
+ * The argument 'firstTidNumber' indicates the first tid location of
+ * the bits stored in this page. This is necessary for locating the bit
+ * of 'tidnum'.
+ *
+ * This update may generate new words that cause this page to overflow.
+ * In this case, we will first check the next bitmap page have enough
+ * space for these new words. If so, we update these two pages. Otherwise,
+ * a new bitmap page is created.
+ */
+static void
+updatesetbit_inpage(Relation rel, uint64 tidnum,
+					Buffer lovBuffer, OffsetNumber lovOffset,
+					Buffer bitmapBuffer, uint64 firstTidNumber,
+					bool use_wal)
+{
+	Page 			bitmapPage;
+	BMBitmapOpaque	bitmapOpaque;
+	BMBitmap		bitmap;
+	Buffer			nextBuffer;
+	Page			nextPage;
+	BMBitmapOpaque	nextOpaque;
+	BMBitmap		nextBitmap;
+
+	uint64			bitNo = 0;
+	uint32			wordNo;
+	uint32          free_words;
+	BM_HRL_WORD		word = 0;
+	bool			found = false;
+
+	BMTIDBuffer     words;
+	BMTIDBuffer     new_words;
+	BMTIDBuffer     words_left;
+
+	bool			new_page;
+	bool			new_lastpage;
+	int             word_no;
+
+	bitmapPage = BufferGetPage(bitmapBuffer);
+	bitmapOpaque = (BMBitmapOpaque)PageGetSpecialPointer(bitmapPage);
+
+	bitmap = (BMBitmap) PageGetContentsMaxAligned(bitmapPage);
+	bitNo = 0;
+
+	// if (Debug_bitmap_print_insert)
+	// 	elog(LOG, "Bitmap Insert: updating a set bit in bitmap block %d, "
+	// 		 "lovBlock=%d, lovOffset=%d"
+	// 		 ", firstTidNumber=" INT64_FORMAT
+	// 		 ", bm_last_tid_location=" INT64_FORMAT
+	// 		 ", tidnum=" INT64_FORMAT
+	// 		 ", idxrelid=%u",
+	// 		 BufferGetBlockNumber(bitmapBuffer),
+	// 		 BufferGetBlockNumber(lovBuffer),
+	// 		 lovOffset,
+	// 		 firstTidNumber,
+	// 		 bitmapOpaque->bm_last_tid_location,
+	// 		 tidnum,
+	// 		 RelationGetRelid(rel));
+	
+	/* Find the word that contains the bit of tidnum. */
+	for (wordNo = 0; wordNo < bitmapOpaque->bm_hrl_words_used; wordNo++)
+	{
+		word = bitmap->cwords[wordNo];
+		if (IS_FILL_WORD(bitmap->hwords, wordNo))
+			bitNo += FILL_LENGTH(word) * BM_HRL_WORD_SIZE;
+		else
+			bitNo += BM_HRL_WORD_SIZE;
+
+		if (firstTidNumber + bitNo - 1 >= tidnum)
+		{
+			found = true;
+			break;		/* find the word */
+		}
+	}
+
+	if (!found)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("could not find bitmap word for tid " INT64_FORMAT
+						" in bitmap index %u"
+						" (relfilenode %u/%u/%u, bitmap block %d, LOV block %d, LOV offset %d)",
+						tidnum, RelationGetRelid(rel),
+						rel->rd_node.spcNode, rel->rd_node.dbNode, rel->rd_node.relNode,
+						BufferGetBlockNumber(bitmapBuffer),
+						BufferGetBlockNumber(lovBuffer), lovOffset),
+				 errhint("Reindex bitmap index \"%s\".", RelationGetRelationName(rel))));
+	}
+
+	Assert (wordNo <= bitmapOpaque->bm_hrl_words_used);
+
+	/*
+	 * If the word containing the updating bit is a literal word,
+	 * we simply update the word, and return.
+	 */
+	if (!IS_FILL_WORD(bitmap->hwords, wordNo))
+	{
+		uint16 insertingPos = (tidnum - 1) % BM_HRL_WORD_SIZE;
+
+		START_CRIT_SECTION();
+
+		MarkBufferDirty(bitmapBuffer);
+
+		bitmap->cwords[wordNo] |= (((BM_HRL_WORD)1)<<insertingPos);
+
+		if (use_wal)
+			_bitmap_log_updateword(rel, bitmapBuffer, wordNo);
+
+		END_CRIT_SECTION();
+		
+		// if (Debug_bitmap_print_insert)
+		// 	elog(LOG, "Bitmap Insert: updated a set bit in bitmap block %d, "
+		// 		 "lovBlock=%d, lovOffset=%d"
+		// 		 ", firstTidNumber=" INT64_FORMAT
+		// 		 ", bm_last_tid_location=" INT64_FORMAT
+		// 		 ", tidnum=" INT64_FORMAT
+		// 		 ", wordNo=%d"
+		// 		 ", idxrelid=%u",
+		// 		 BufferGetBlockNumber(bitmapBuffer),
+		// 		 BufferGetBlockNumber(lovBuffer),
+		// 		 lovOffset,
+		// 		 firstTidNumber,
+		// 		 bitmapOpaque->bm_last_tid_location,
+		// 		 tidnum,
+		// 		 wordNo,
+		// 		 RelationGetRelid(rel));
+
+		return;
+	}
+
+	/* If this bit is already 1, then simply return. */
+	if (GET_FILL_BIT(word) == 1)
+	{
+		// if (Debug_bitmap_print_insert)
+		// 	elog(LOG, "Bitmap Insert: no update is needed in bitmap block %d, "
+		// 		 "lovBlock=%d, lovOffset=%d"
+		// 		 ", firstTidNumber=" INT64_FORMAT
+		// 		 ", bm_last_tid_location=" INT64_FORMAT
+		// 		 ", tidnum=" INT64_FORMAT
+		// 		 ", wordNo=%d"
+		// 		 ", idxrelid=%u",
+		// 		 BufferGetBlockNumber(bitmapBuffer),
+		// 		 BufferGetBlockNumber(lovBuffer),
+		// 		 lovOffset,
+		// 		 firstTidNumber,
+		// 		 bitmapOpaque->bm_last_tid_location,
+		// 		 tidnum,
+		// 		 wordNo,
+		// 		 RelationGetRelid(rel));
+		
+		return;
+	}
+
+	firstTidNumber = firstTidNumber + bitNo -
+					 FILL_LENGTH(word) * BM_HRL_WORD_SIZE;
+		
+	Assert(tidnum >= firstTidNumber);
+
+	MemSet(&new_words, 0, sizeof(new_words));
+	buf_extend(&new_words);
+	updatesetbit_inword(word, tidnum - firstTidNumber, firstTidNumber,
+						&new_words);
+
+	/* Make sure that there are at most 3 new words. */
+	Assert(new_words.curword <= 3);
+
+	if (new_words.curword == 1)
+	{
+		uint32		off = wordNo/BM_HRL_WORD_SIZE;
+
+		START_CRIT_SECTION();
+
+		MarkBufferDirty(bitmapBuffer);
+
+		bitmap->cwords[wordNo] = new_words.cwords[0];
+		bitmap->hwords[off] &= (BM_HRL_WORD)(~WORDNO_GET_HEADER_BIT(wordNo));
+
+		if (IS_FILL_WORD(new_words.hwords, 0))
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("incorrect header bit found in bitmap index %u; expected header bit 1"
+							" (relfilenode %u/%u/%u, bitmap block %d, LOV block %d, LOV offset %d)",
+							RelationGetRelid(rel),
+							rel->rd_node.spcNode, rel->rd_node.dbNode, rel->rd_node.relNode,
+							BufferGetBlockNumber(bitmapBuffer),
+							BufferGetBlockNumber(lovBuffer), lovOffset)));
+
+		Assert(IS_FILL_WORD(new_words.hwords, 0) ==
+			   IS_FILL_WORD(bitmap->hwords, wordNo));
+
+		if (use_wal)
+			_bitmap_log_updateword(rel, bitmapBuffer, wordNo);
+
+		END_CRIT_SECTION();
+
+		// if (Debug_bitmap_print_insert)
+		// 	elog(LOG, "Bitmap Insert: updated a set bit in bitmap block %d, "
+		// 		 "lovBlock=%d, lovOffset=%d"
+		// 		 ", firstTidNumber=" INT64_FORMAT
+		// 		 ", bm_last_tid_location=" INT64_FORMAT
+		// 		 ", tidnum=" INT64_FORMAT
+		// 		 ", wordNo=%d, header bit=%d, idxrelid=%u",
+		// 		 BufferGetBlockNumber(bitmapBuffer),
+		// 		 BufferGetBlockNumber(lovBuffer),
+		// 		 lovOffset,
+		// 		 firstTidNumber,
+		// 		 bitmapOpaque->bm_last_tid_location,
+		// 		 tidnum,
+		// 		 wordNo,
+		// 		 IS_FILL_WORD(bitmap->hwords, off),
+		// 		 RelationGetRelid(rel));
+		return;		
+	}
+
+	/*
+	 * Check if this page has enough space for all new words. If so,
+	 * replace this word with new words. Otherwise,
+	 * we first check if the next page has enough space for all new words.
+	 * If so, insert new words to the next page, otherwise,
+	 * create a new page.
+	 */
+	free_words = BM_NUM_OF_HRL_WORDS_PER_PAGE -
+			bitmapOpaque->bm_hrl_words_used;
+
+	new_page = false;
+	new_lastpage = false;
+	nextBuffer = InvalidBuffer;
+
+	if (free_words < new_words.curword - 1)
+	{
+		if (bitmapOpaque->bm_bitmap_next != InvalidBlockNumber)
+		{
+			nextBuffer = _bitmap_getbuf(rel, bitmapOpaque->bm_bitmap_next,
+										BM_WRITE);
+			nextPage = BufferGetPage(nextBuffer);
+			nextOpaque = (BMBitmapOpaque)PageGetSpecialPointer(nextPage);
+			free_words = BM_NUM_OF_HRL_WORDS_PER_PAGE -
+				nextOpaque->bm_hrl_words_used;
+		} else
+		{
+			new_lastpage = true;
+		}
+	}
+
+	if (free_words < new_words.curword - 1)
+	{
+		if (BufferIsValid(nextBuffer))
+			_bitmap_relbuf(nextBuffer);
+
+		nextBuffer = _bitmap_getbuf(rel, P_NEW, BM_WRITE);
+		_bitmap_init_bitmappage(BufferGetPage(nextBuffer));
+		new_page = true;
+		free_words = BM_NUM_OF_HRL_WORDS_PER_PAGE;
+	}
+
+	START_CRIT_SECTION();
+
+	MarkBufferDirty(bitmapBuffer);
+	if (BufferIsValid(nextBuffer))
+		MarkBufferDirty(nextBuffer);
+
+	if (new_lastpage)
+	{
+		Page 		lovPage;
+		BMLOVItem	lovItem;
+		MarkBufferDirty(lovBuffer);
+
+		lovPage = BufferGetPage(lovBuffer);
+		lovItem = (BMLOVItem) PageGetItem(lovPage, 
+			PageGetItemId(lovPage, lovOffset));
+		lovItem->bm_lov_tail = BufferGetBlockNumber(nextBuffer);
+	}
+
+	// if (Debug_bitmap_print_insert)
+	// 	elog(LOG, "Bitmap Insert: updated a set bit in bitmap block %d, "
+	// 		 "lovBlock=%d, lovOffset=%d"
+	// 		 ", firstTidNumber=" INT64_FORMAT
+	// 		 ", bm_last_tid_location=" INT64_FORMAT
+	// 		 ", tidnum=" INT64_FORMAT
+	// 		 ", generate %d new words, %d new bitmap page"
+	// 		 ", idxrelid=%u",
+	// 		 BufferGetBlockNumber(bitmapBuffer),
+	// 		 BufferGetBlockNumber(lovBuffer),
+	// 		 lovOffset,
+	// 		 firstTidNumber,
+	// 		 bitmapOpaque->bm_last_tid_location,
+	// 		 tidnum,
+	// 		 new_words.curword,
+	// 		 new_page,
+	// 		 RelationGetRelid(rel));
+
+	bitmap->cwords[wordNo] = new_words.cwords[0];
+	if (tidnum - firstTidNumber + 1 <= BM_HRL_WORD_SIZE)
+	{
+		uint32		off = wordNo/BM_HRL_WORD_SIZE;
+
+		bitmap->hwords[off] &= (BM_HRL_WORD)(~WORDNO_GET_HEADER_BIT(wordNo));
+		if (IS_FILL_WORD(new_words.hwords, 0))
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("incorrect header bit found in bitmap index %u; expected header bit 1"
+							" (relfilenode %u/%u/%u, bitmap block %d, LOV block %d, LOV offset %d)",
+							RelationGetRelid(rel),
+							rel->rd_node.spcNode, rel->rd_node.dbNode, rel->rd_node.relNode,
+							BufferGetBlockNumber(bitmapBuffer),
+							BufferGetBlockNumber(lovBuffer), lovOffset)));
+	}
+
+	/* ignore the first word in new_words.cwords. */
+	new_words.hwords[0] = ((BM_HRL_WORD)new_words.hwords[0]) << 1;
+	for (word_no = 0; word_no < new_words.curword - 1; word_no++)
+		new_words.cwords[word_no] = new_words.cwords[word_no+1];
+	new_words.curword--;
+
+	/* Create the buffer for the original words */
+	MemSet(&words, 0, sizeof(words));
+	words.cwords = bitmap->cwords;
+	memcpy(words.hwords, bitmap->hwords,
+		   BM_CALC_H_WORDS(bitmapOpaque->bm_hrl_words_used) * sizeof(BM_HRL_WORD));
+	words.num_cwords = BM_NUM_OF_HRL_WORDS_PER_PAGE;
+	words.curword = bitmapOpaque->bm_hrl_words_used;
+
+	MemSet(&words_left, 0, sizeof(words_left));
+	buf_extend(&words_left);
+
+	insert_newwords(&words, wordNo + 1, &new_words, &words_left);
+
+	/*
+	 * We have to copy header words back to the page, and set the correct
+	 * number of words in the page.
+	 */
+	bitmapOpaque->bm_hrl_words_used = words.curword;
+	memcpy(bitmap->hwords, words.hwords,
+		   BM_CALC_H_WORDS(bitmapOpaque->bm_hrl_words_used) * sizeof(BM_HRL_WORD));
+
+	if (new_page)
+	{
+		nextPage = BufferGetPage(nextBuffer);
+		nextOpaque = (BMBitmapOpaque)PageGetSpecialPointer(nextPage);
+		nextBitmap = (BMBitmap)PageGetContentsMaxAligned(nextPage);
+
+		nextOpaque->bm_last_tid_location = bitmapOpaque->bm_last_tid_location;
+		nextOpaque->bm_bitmap_next = bitmapOpaque->bm_bitmap_next;
+		bitmapOpaque->bm_bitmap_next = BufferGetBlockNumber(nextBuffer);
+	}
+
+	bitmapOpaque->bm_last_tid_location -=
+		GET_NUM_BITS(words_left.cwords, words_left.hwords, words_left.curword);
+
+	if (words_left.curword > 0)
+	{
+		nextPage = BufferGetPage(nextBuffer);
+		nextOpaque = (BMBitmapOpaque)PageGetSpecialPointer(nextPage);
+		nextBitmap = (BMBitmap)PageGetContentsMaxAligned(nextPage);
+
+		/* Create the buffer for the original words */
+		MemSet(&words, 0, sizeof(words));
+		words.cwords = nextBitmap->cwords;
+		memcpy(words.hwords, nextBitmap->hwords,
+			   BM_CALC_H_WORDS(nextOpaque->bm_hrl_words_used) * sizeof(BM_HRL_WORD));
+		words.num_cwords = BM_NUM_OF_HRL_WORDS_PER_PAGE;
+		words.curword = nextOpaque->bm_hrl_words_used;
+
+		MemSet(&new_words, 0, sizeof(new_words));
+
+		insert_newwords(&words, 0, &words_left, &new_words);
+
+		/*
+		 * We have to copy header words back to the page, and set the correct
+		 * number of words in the page.
+		 */
+		nextOpaque->bm_hrl_words_used = words.curword;
+		memcpy(nextBitmap->hwords, words.hwords,
+			   BM_CALC_H_WORDS(nextOpaque->bm_hrl_words_used) * sizeof(BM_HRL_WORD));
+
+		SIMPLE_FAULT_INJECTOR("rearrange_word_to_next_bitmap_page");
+		Assert(new_words.curword == 0);
+	}
+
+	if (use_wal)
+		_bitmap_log_updatewords(rel, lovBuffer, lovOffset,
+								bitmapBuffer, nextBuffer, new_lastpage);
+
+	END_CRIT_SECTION();
+
+	if (BufferIsValid(nextBuffer))
+		_bitmap_relbuf(nextBuffer);
+	_bitmap_free_tidbuf(&new_words);
+	_bitmap_free_tidbuf(&words_left);
+}
+
+/*
+ * findbitmappage() -- find the bitmap page that contains
+ *	the given tid location, and obtain the first tid location
+ * 	in this page.
+ *
+ * We assume that this tid location is not in bm_last_compword or
+ * bm_last_word of its LOVItem.
+ *
+ * We will have write lock on the bitmap page we find.
+ */
+static void
+findbitmappage(Relation rel, BMLOVItem lovitem,
+					   uint64 tidnum,
+					   Buffer* bitmapBufferP, uint64* firstTidNumberP)
+{
+	BlockNumber nextBlockNo = lovitem->bm_lov_head;
+
+	*firstTidNumberP = 1;
+
+	while (BlockNumberIsValid(nextBlockNo))
+	{
+		Page bitmapPage;
+		BMBitmapOpaque bitmapOpaque;
+
+		CHECK_FOR_INTERRUPTS();
+
+		*bitmapBufferP = _bitmap_getbuf(rel, nextBlockNo, BM_WRITE);
+		bitmapPage = BufferGetPage(*bitmapBufferP);
+		bitmapOpaque = (BMBitmapOpaque)
+			PageGetSpecialPointer(bitmapPage);
+
+		if (bitmapOpaque->bm_last_tid_location >= tidnum)
+			return;   		/* find the page */
+
+		(*firstTidNumberP) = bitmapOpaque->bm_last_tid_location + 1;
+		nextBlockNo = bitmapOpaque->bm_bitmap_next;
+
+		_bitmap_relbuf(*bitmapBufferP);
+	}
+
+	/*
+	 * We can't find such a page. This should not happen.
+	 * So we error out.
+	 */
+	ereport(ERROR,
+			(errcode(ERRCODE_INDEX_CORRUPTED),
+			 errmsg("could not find bitmap page containing tid " INT64_FORMAT
+					" in bitmap index %u (relfilenode %u/%u/%u"
+					", next block %d, LOV head %d, LOV tail %d"
+					", firstTidNumber " INT64_FORMAT
+					", bm_last_tid_location " INT64_FORMAT
+					", bm_last_setbit " INT64_FORMAT
+					", bm_last_compword " INT64_FORMAT
+					", bm_last_word " INT64_FORMAT
+					", lov_words_header %d)",
+					tidnum, RelationGetRelid(rel),
+					rel->rd_node.spcNode, rel->rd_node.dbNode, rel->rd_node.relNode,
+					nextBlockNo, lovitem->bm_lov_head,
+					lovitem->bm_lov_tail, *firstTidNumberP, lovitem->bm_last_tid_location,
+					lovitem->bm_last_setbit, lovitem->bm_last_compword,
+					lovitem->bm_last_word, lovitem->lov_words_header),
+			 errhint("Reindex bitmap index \"%s\".", RelationGetRelationName(rel))));
+}
+
+static void
+buf_make_space(Relation rel, BMTidBuildBuf *locbuf, bool use_wal)
+{
+	ListCell *cell;
+
+	/*
+	 * Now, we could just pull the head of lov_blocks but there'd be no
+	 * guarantee that we'd free up enough space.
+	 */
+	foreach(cell, locbuf->lov_blocks)
+	{
+		int i;
+		BMTIDLOVBuffer *lov_buf = (BMTIDLOVBuffer *)lfirst(cell);
+		BlockNumber lov_block = lov_buf->lov_block;
+
+		for (i = 0; i < BM_MAX_LOVITEMS_PER_PAGE; i++)
+		{
+			BMTIDBuffer *buf = (BMTIDBuffer *)lov_buf->bufs[i];
+			OffsetNumber off;
+
+			/* return if we've freed enough space */
+#ifdef NOT_USED
+			if (locbuf->byte_size < (maintenance_work_mem * 1024L))
+				return;
+#endif
+			if (!buf || buf->num_cwords == 0)
+				continue;
+
+			off = i + 1;
+			locbuf->byte_size -= buf_free_mem(rel, buf, lov_block, off, use_wal);
+
+			if (QueryCancelPending || ProcDiePending)
+				return;
+		}
+#ifdef NOT_USED
+		if (locbuf->byte_size < (maintenance_work_mem * 1024L))
+			return;
+#endif
+	}
+}
+
+static uint16
+buf_free_mem_block(Relation rel, BMTIDBuffer *buf, Buffer lovbuf,
+			 OffsetNumber off, bool use_wal)
+{
+	/* already done */
+	if (buf->num_cwords == 0)
+		return 0;
+
+	_bitmap_write_new_bitmapwords(rel, lovbuf, off, buf, use_wal);
+
+	return _bitmap_free_tidbuf(buf);
+}
+
+static uint16
+buf_free_mem(Relation rel, BMTIDBuffer *buf, BlockNumber lov_block,
+			 OffsetNumber off, bool use_wal)
+{
+	Buffer lovbuf;
+	uint16 bytes_freed;
+
+	/* already done */
+	if (buf->num_cwords == 0)
+		return 0;
+
+	lovbuf = _bitmap_getbuf(rel, lov_block, BM_WRITE);
+
+	bytes_freed = buf_free_mem_block(rel, buf, lovbuf, off, use_wal);
+
+	_bitmap_relbuf(lovbuf);
+
+	return bytes_freed;
+}
+
+/*
+ * _bitmap_write_bitmapwords_on_page() -- Write an array of bitmap words into
+ * the given bitmap page. Returns the number of words that have been written
+ * in this call.
+ *
+ * The number of bitmap words writing to a given bitmap page is the maximum
+ * number of words that can be appended into the page.
+ */
+static uint64
+_bitmap_write_bitmapwords_on_page(Page bitmapPage, BMTIDBuffer *buf, int startWordNo,
+								  xl_bm_bitmapwords_perpage *xlrec_perpage)
+{
+	BMBitmapOpaque	bitmapPageOpaque = (BMBitmapOpaque)PageGetSpecialPointer(bitmapPage);
+	BMBitmap		bitmap = (BMBitmap) PageGetContentsMaxAligned(bitmapPage);
+	uint64			cwords;
+	uint64 			words_written;
+	uint64			start_hword_no, end_hword_no;
+	uint64			final_start_hword_no, final_end_hword_no;
+	BM_HRL_WORD		hwords[BM_MAX_NUM_OF_HEADER_WORDS + 1];
+	uint64			num_hwords;
+	uint32			start_hword_bit, end_hword_bit, final_start_hword_bit;
+
+	cwords = bitmapPageOpaque->bm_hrl_words_used;
+
+	words_written = buf->curword - startWordNo;
+	if (words_written > BM_NUM_OF_HRL_WORDS_PER_PAGE - cwords)
+		words_written = BM_NUM_OF_HRL_WORDS_PER_PAGE - cwords;
+
+	if (words_written == 0)
+	{
+		/*
+		 * This page is full. We still include it in the WAL record, to keep this
+		 * case the same as the general case.
+		 */
+		if (xlrec_perpage)
+		{
+			xlrec_perpage->bmp_last_tid = bitmapPageOpaque->bm_last_tid_location;
+			xlrec_perpage->bmp_start_hword_no = 0;
+			xlrec_perpage->bmp_num_hwords = 0;
+			xlrec_perpage->bmp_start_cword_no = cwords;
+			xlrec_perpage->bmp_num_cwords = 0;
+		}
+		return 0;
+	}
+
+	/* Copy the content words */
+	memcpy(bitmap->cwords + cwords,
+		   buf->cwords + startWordNo,
+		   words_written * sizeof(BM_HRL_WORD));
+	/* and make note of what we changed for the WAL record */
+	if (xlrec_perpage)
+	{
+		xlrec_perpage->bmp_start_cword_no = cwords;
+		xlrec_perpage->bmp_num_cwords = words_written;
+	}
+
+	/*
+	 * Shift the header words in 'words' to match with the bit positions
+	 * in the header words in this page, and then copy them.
+	 */
+	start_hword_no = startWordNo/BM_HRL_WORD_SIZE;
+	end_hword_no = (startWordNo + words_written - 1) / BM_HRL_WORD_SIZE;
+	num_hwords = end_hword_no - start_hword_no + 1;
+
+	Assert(num_hwords < BM_MAX_NUM_OF_HEADER_WORDS);
+	memcpy(hwords, buf->hwords + start_hword_no,
+			num_hwords * sizeof(BM_HRL_WORD));
+	hwords[num_hwords] = 0;
+
+	/* clean up the first and last header words */
+	start_hword_bit = startWordNo % BM_HRL_WORD_SIZE;
+	end_hword_bit = (startWordNo + words_written - 1) % BM_HRL_WORD_SIZE;
+
+	hwords[0] = ((BM_HRL_WORD)(hwords[0] << start_hword_bit)) >>
+				start_hword_bit;
+	hwords[num_hwords - 1] = (hwords[num_hwords - 1] >>
+			(BM_HRL_WORD_SIZE - end_hword_bit - 1)) <<
+			(BM_HRL_WORD_SIZE - end_hword_bit - 1);
+
+	final_start_hword_bit = cwords % BM_HRL_WORD_SIZE;
+
+	if (final_start_hword_bit > start_hword_bit)
+	{
+		/* right-shift 'final-start_hword_bit - start_hword_bit' */
+		rshift_header_bits(hwords, num_hwords + 1,
+						   final_start_hword_bit - start_hword_bit);
+	}
+		
+	else if (final_start_hword_bit < start_hword_bit)
+	{
+		/* left-shift 'start_hword_bit - final_start_hword_bit' */
+		lshift_header_bits(hwords, num_hwords,
+						   start_hword_bit - final_start_hword_bit);
+	}
+
+	/* copy the header bits */
+	final_start_hword_no = cwords / BM_HRL_WORD_SIZE;
+	final_end_hword_no = (cwords + words_written - 1) / BM_HRL_WORD_SIZE;
+
+	bitmap->hwords[final_start_hword_no] |= hwords[0];
+	memcpy(bitmap->hwords + (final_start_hword_no + 1),
+		   hwords + 1,
+		   (final_end_hword_no - final_start_hword_no) *
+			sizeof(BM_HRL_WORD));
+	/* and make note of what we changed for the WAL record */
+	if (xlrec_perpage)
+	{
+		xlrec_perpage->bmp_start_hword_no = final_start_hword_no;
+		xlrec_perpage->bmp_num_hwords = (final_end_hword_no + 1) - final_start_hword_no;
+	}
+
+	bitmapPageOpaque->bm_hrl_words_used += words_written;
+
+	// if (Debug_bitmap_print_insert)
+	// {
+	// 	elog(LOG, "Bitmap Insert: insert bitmapwords: "
+	// 		 ", old bm_last_tid_location=" INT64_FORMAT
+	// 		 ", new bm_last_tid_location=" INT64_FORMAT
+	// 		 ", first last_tid=" INT64_FORMAT
+	// 		 ", last_compword=" INT64_FORMAT
+	// 		 ", is_last_compword_fill=%s"
+	// 		 ", last_word=" INT64_FORMAT
+	// 		 ", last_setbit=" INT64_FORMAT,
+	// 		 bitmapPageOpaque->bm_last_tid_location,
+	// 		 buf->last_tids[startWordNo + words_written-1],
+	// 		 buf->last_tids[startWordNo],
+	// 		 buf->last_compword,
+	// 		 (buf->is_last_compword_fill ? "yes" : "no"),
+	// 		 buf->last_word,
+	// 		 buf->last_tid);
+	//}
+
+	Assert(bitmapPageOpaque->bm_last_tid_location <=
+		   buf->last_tids[startWordNo + words_written-1]);
+
+	bitmapPageOpaque->bm_last_tid_location =
+		buf->last_tids[startWordNo + words_written-1];
+	if (xlrec_perpage)
+		xlrec_perpage->bmp_last_tid = bitmapPageOpaque->bm_last_tid_location;
+
+	return words_written;
+}
+
+/*
+ * mergewords() -- merge last two bitmap words based on the HRL compression
+ * 	scheme. If these two words can not be merged, the last complete
+ * 	word will be appended into the word array in the buffer.
+ *
+ * If the buffer is extended, this function returns the number
+ * of bytes used.
+ */
+static int16
+mergewords(BMTIDBuffer *buf, bool lastWordFill)
+{
+	int16 bytes_used = 0;
+
+	/* the last_tid in the complete word */
+	uint64 last_tid = buf->last_tid - buf->last_tid%BM_HRL_WORD_SIZE;
+
+	/*
+	 * If last_compword is LITERAL_ALL_ONE, it is not set yet.
+	 * We move last_word to it.
+	 */
+	if (buf->last_compword == LITERAL_ALL_ONE)
+	{
+		buf->last_compword = buf->last_word;
+		buf->is_last_compword_fill = lastWordFill;
+		if (lastWordFill)
+			last_tid = FILL_LENGTH(buf->last_word) * BM_HRL_WORD_SIZE;
+		else
+			last_tid = BM_HRL_WORD_SIZE;
+
+		buf->last_word = 0;
+		buf->last_tid = last_tid;
+
+		return bytes_used;
+	}
+	/*
+	 * If both words are fill words, and have the same fill bit,
+	 * we increment the fill length of the last complete word by
+	 * the fill length stored in the last word.
+	 */
+	if (buf->is_last_compword_fill && lastWordFill &&
+		(GET_FILL_BIT(buf->last_compword) ==
+		 GET_FILL_BIT(buf->last_word)))
+	{
+		BM_HRL_WORD lengthMerged;
+			
+		if (FILL_LENGTH(buf->last_compword) + FILL_LENGTH(buf->last_word) <=
+			MAX_FILL_LENGTH)
+		{
+			last_tid += FILL_LENGTH(buf->last_word)*BM_HRL_WORD_SIZE;
+			buf->last_compword += FILL_LENGTH(buf->last_word);
+			buf->last_word = LITERAL_ALL_ZERO;
+			buf->last_tid = last_tid;
+
+			return bytes_used;
+		}
+
+		lengthMerged =
+			MAX_FILL_LENGTH - FILL_LENGTH(buf->last_compword);
+		buf->last_word -= lengthMerged;
+		last_tid += lengthMerged * BM_HRL_WORD_SIZE;
+		buf->last_compword += lengthMerged;
+	}
+
+	/*
+	 * Here, these two words can not be merged together. We
+	 * move the last complete word to the array, and set it to be the
+	 * last word.
+	 */
+
+	/*
+	 * When there are not enough space in the array of new words,
+	 * we re-allocate a bigger space.
+	 */
+	bytes_used += buf_extend(buf);
+
+	buf->cwords[buf->curword] = buf->last_compword;
+	buf->last_tids[buf->curword] = last_tid;
+
+	if (buf->is_last_compword_fill)
+		buf->hwords[buf->curword/BM_HRL_WORD_SIZE] |=
+			((BM_HRL_WORD)1) << (BM_HRL_WORD_SIZE - 1 -
+								 buf->curword % BM_HRL_WORD_SIZE);
+
+	buf->curword ++;
+
+	buf->last_compword = buf->last_word;
+	buf->is_last_compword_fill = lastWordFill;
+	if (buf->is_last_compword_fill)
+		last_tid += FILL_LENGTH(buf->last_compword) * BM_HRL_WORD_SIZE;
+	else
+		last_tid += BM_HRL_WORD_SIZE;
+
+	buf->last_word = 0;
+	buf->last_tid = last_tid;
+
+	return bytes_used;
+}
+
+/*
+ * insert_newwords() -- insert a buffer of new words into a given buffer of
+ *   words at a specified position.
+ *
+ * The new words will be inserted into the positions starting from
+ * 'insertPos'(>=0). The original words from 'insertPos' will be shifted
+ * to the right. If the given array does not have enough space to
+ * hold all words, the last '(*numWordsP+numNewWords-maxNumWords)' words
+ * will be stored in the buffer 'words_left', for which the caller should set
+ * the enough space to hold these left words.
+ *
+ * All three buffers are specified as BMTIDBuffer objects, in which the following
+ * fields are used:
+ *   curword -- the number of content words in this buffer.
+ *   num_cwords -- the maximum number of content words that are allowed.
+ *   hwords -- the header words
+ *   cwords -- the content words
+ *
+ * This function assumes that the number of new words is not greater than BM_HRL_WORD_SIZE.
+ */
+static void
+insert_newwords(BMTIDBuffer* words, uint32 insertPos,
+				BMTIDBuffer* new_words, BMTIDBuffer* words_left)
+{
+	int32	wordNo;
+	uint16  bitLoc;
+
+	Assert(new_words->curword <= BM_HRL_WORD_SIZE);
+	Assert(insertPos <= words->num_cwords);
+
+	words_left->curword = 0;
+
+	/* if there are no words in the original buffer, we simply copy the new words. */
+	if (words->curword == 0)
+	{
+		memcpy(words->cwords, new_words->cwords, new_words->curword*sizeof(BM_HRL_WORD));
+		memcpy(words->hwords, new_words->hwords,
+			   BM_CALC_H_WORDS(new_words->curword) * sizeof(BM_HRL_WORD));
+		words->curword = new_words->curword;
+
+		return;
+	}
+
+	/*
+	 * if insertPos is pointing to the position after the maximum position
+	 * in this word, we simply copy the new words to leftContentWords.
+	 */
+	if (insertPos == words->num_cwords)
+	{
+		memcpy(words_left->cwords, new_words->cwords,
+			   new_words->curword * sizeof(BM_HRL_WORD));
+		memcpy(words_left->hwords, new_words->hwords,
+			   BM_CALC_H_WORDS(new_words->curword) * sizeof(BM_HRL_WORD));
+		words_left->curword = new_words->curword;
+
+		return;
+	}
+
+	Assert(words->curword > 0);
+
+	/* Calculate how many words left after this insert. */
+	if (words->curword + new_words->curword > words->num_cwords)
+		words_left->curword = words->curword + new_words->curword - words->num_cwords;
+	MemSet(words_left->hwords, 0, BM_NUM_OF_HEADER_WORDS * sizeof(BM_HRL_WORD));
+
+	/*
+	 * Walk from the last word in the array back to 'insertPos'.
+	 * If the word no + new_words->curword is greater than words->num_cwords,
+	 * we store these words in words_left.
+	 */
+	for (wordNo=words->curword-1; wordNo>=0 && wordNo>=insertPos; wordNo--)
+	{
+		if (wordNo + new_words->curword >= words->num_cwords)
+		{
+			words_left->cwords[wordNo+new_words->curword-words->num_cwords] = 
+				words->cwords[wordNo];
+			if (IS_FILL_WORD(words->hwords, wordNo))
+			{
+				uint32		o = (int)wordNo/BM_HRL_WORD_SIZE;
+				uint32		n = wordNo + new_words->curword - words->num_cwords;
+
+				words_left->hwords[0] |= WORDNO_GET_HEADER_BIT(n);
+				words->hwords[o] &= ~(WORDNO_GET_HEADER_BIT(wordNo));
+			}
+		}
+		else
+			words->cwords[wordNo + new_words->curword] = words->cwords[wordNo];
+	}
+
+	/* insert new words */
+	for (wordNo=0; wordNo<new_words->curword; wordNo++)
+	{
+		if (insertPos+wordNo>= words->num_cwords)
+		{
+			uint32 	n = insertPos + wordNo - words->num_cwords;
+
+			words_left->cwords[n] = new_words->cwords[wordNo];
+			if (IS_FILL_WORD(new_words->hwords, wordNo))
+				words_left->hwords[0] |= WORDNO_GET_HEADER_BIT(n);
+		}
+		else
+			words->cwords[insertPos+wordNo] = new_words->cwords[wordNo];
+	}
+
+	/* right-shift the bits in the header words */
+	shift_header_bits(words->hwords, words->curword, 
+					  BM_NUM_OF_HEADER_WORDS, insertPos,
+					  new_words->curword);
+
+	/* set the newWords header bits */
+	for (bitLoc = insertPos;
+		 bitLoc < insertPos + new_words->curword && bitLoc < words->num_cwords;
+		 bitLoc++)
+	{
+		if (IS_FILL_WORD(new_words->hwords, bitLoc-insertPos))
+		{
+			uint32		off = (uint32)bitLoc/BM_HRL_WORD_SIZE;
+
+			words->hwords[off] |= WORDNO_GET_HEADER_BIT(bitLoc);
+		}
+	}
+
+	words->curword += (new_words->curword - words_left->curword);	
+}
+
+/* * shift_header_bits() -- right-shift bits after 'startLoc' for
+ * 	'numofShiftingBits' bits.
+ *
+ * These bits are stored in an array of words with the word size of
+ * BM_HRL_WORD_SIZE. This shift is done in-place. The maximum number of
+ * words in this array is given. If the shifting causes the array not to
+ * have enough space for all bits, the right-most overflow bits will be
+ * discarded. The value 'startLoc' starts with 0.
+ */
+static void
+shift_header_bits(BM_HRL_WORD* words, uint32 numOfBits,
+						  uint32 maxNumOfWords, uint32 startLoc,
+						  uint32 numOfShiftingBits)
+{
+	uint32	startWordNo;
+	uint32	endWordNo;
+	uint32	wordNo;
+	uint32	numOfFinalShiftingBits;
+	BM_HRL_WORD tmpWord;
+
+	Assert(startLoc <= numOfBits);
+	Assert((numOfBits-1)/BM_HRL_WORD_SIZE < maxNumOfWords);
+
+	startWordNo = startLoc/BM_HRL_WORD_SIZE;
+	endWordNo = (numOfBits-1)/BM_HRL_WORD_SIZE;
+
+	for (wordNo = endWordNo; wordNo > startWordNo; wordNo--)
+	{
+		/*
+		 * obtain the last 'numOfShiftingBits' bits in the words[wordNo],
+		 * and store them in the high-end of a word.
+		 */
+		tmpWord = (((BM_HRL_WORD)words[wordNo])<<
+					(BM_HRL_WORD_SIZE-numOfShiftingBits));
+
+		/* right-shift the original word 'numOfShiftingBits' bits. */
+		words[wordNo] =	(((BM_HRL_WORD)words[wordNo])>>numOfShiftingBits);
+
+		/* OR those shifted bits into the next word in the array. */
+		if (wordNo < maxNumOfWords-1)
+			words[wordNo + 1] |= tmpWord;
+		
+	}
+
+	/* obtain bits after 'startLoc'.*/
+	tmpWord = ((BM_HRL_WORD)(words[startWordNo]<<
+				(startLoc%BM_HRL_WORD_SIZE)))>>(startLoc%BM_HRL_WORD_SIZE);
+
+	/*
+	 * When startLoc%BM_HRL_WORD_SIZE is 0, we want to shift all 64 bits.
+	 * There is no way to use the bit-shifting to shift all 64 bits out
+	 * of a 64-bit integer. So just simply set the word to 0.
+	 * Otherwise, use bit-shifting to shift out the bits after 'startLoc'.
+	 */
+	if (startLoc%BM_HRL_WORD_SIZE > 0)
+	{
+		words[startWordNo] = ((BM_HRL_WORD)(words[startWordNo]>>
+											(BM_HRL_WORD_SIZE-startLoc%BM_HRL_WORD_SIZE)))<<
+			(BM_HRL_WORD_SIZE-startLoc%BM_HRL_WORD_SIZE);
+	}
+	else
+	{
+		words[startWordNo] = 0;
+	}
+
+	numOfFinalShiftingBits = numOfShiftingBits;
+	if (BM_HRL_WORD_SIZE - startLoc % BM_HRL_WORD_SIZE < numOfShiftingBits)
+		numOfFinalShiftingBits = BM_HRL_WORD_SIZE - startLoc % BM_HRL_WORD_SIZE;
+
+	words[startWordNo] |= (tmpWord>>numOfFinalShiftingBits);
+
+	if (startWordNo < maxNumOfWords-1)
+	{
+		tmpWord = ((BM_HRL_WORD)(tmpWord << (BM_HRL_WORD_SIZE - numOfFinalShiftingBits)))>>
+			(numOfShiftingBits - numOfFinalShiftingBits);
+		words[startWordNo+1] |= tmpWord;
+	}
+}
+
+/*
+ * lshift_header_bits() -- 'in-place' left-shift bits in given words
+ * 	'bits' bits.
+ *
+ * Assume that 'bits' is smaller than BM_HRL_WORD_SIZE. The left-most
+ * 'bits' bits will be ignored.
+ */
+static void
+lshift_header_bits(BM_HRL_WORD* words, uint64 nwords,
+				   uint32 bits)
+{
+	uint32 word_no;
+	Assert(bits < BM_HRL_WORD_SIZE);
+
+	for (word_no = 0; word_no < nwords; word_no++)
+	{
+		BM_HRL_WORD shifting_bits = 
+			words[word_no] >> (BM_HRL_WORD_SIZE - bits);
+		words[word_no] = ((BM_HRL_WORD)words[word_no]) << bits;
+
+		if (word_no != 0)
+			words[word_no - 1] |= shifting_bits;
+	}
+}
+
+/*
+ * rshift_header_bits() -- 'in-place' right-shift bits in given words
+ * 	'bits' bits.
+ *
+ * Assume that 'bits' is smaller than BM_HRL_WORD_SIZE. The right-most
+ * 'bits' bits will be ignored.
+ */
+static void
+rshift_header_bits(BM_HRL_WORD* words, uint64 nwords,
+				   uint32 bits)
+{
+	BM_HRL_WORD shifting_bits = 0;
+	uint32 word_no;
+
+	Assert(bits < BM_HRL_WORD_SIZE);
+
+	for (word_no = 0; word_no < nwords; word_no++)
+	{
+		BM_HRL_WORD new_shifting_bits = 
+			((BM_HRL_WORD)words[word_no]) << (BM_HRL_WORD_SIZE - bits);
+		words[word_no] = (words[word_no] >> bits) | shifting_bits;
+
+		shifting_bits = new_shifting_bits;
+	}
+}
+
+/*
+ * inserttuple() -- insert a new tuple into the bitmap index.
+ *
+ * This function finds the corresponding bitmap vector associated with
+ * the given attribute value, and inserts a set bit into this bitmap
+ * vector. Each distinct attribute value is stored as a LOV item, which
+ * is stored in a list of LOV pages.
+ *
+ * If there is no LOV item associated with the given attribute value,
+ * a new LOV item is created and appended into the last LOV page.
+ *
+ * For support the high-cardinality case for attributes to be indexed,
+ * we also maintain an auxiliary heap and a btree structure for all
+ * the distinct attribute values so that the search for the
+ * corresponding bitmap vector can be done faster. The heap
+ * contains all attributes to be indexed and 2 more attributes --
+ * the block number of the offset number of the block that stores
+ * the corresponding LOV item. The b-tree index is on this new heap
+ * and the key contains all attributes to be indexed.
+ */
+static void
+inserttuple(Relation rel, Buffer metabuf, uint64 tidnum, 
+			ItemPointerData ht_ctid pg_attribute_unused(), TupleDesc tupDesc, Datum *attdata,
+			bool *nulls, Relation lovHeap, Relation lovIndex, ScanKey scanKey,
+		   	IndexScanDesc scanDesc, bool use_wal)
+{
+	BlockNumber		lovBlock;
+	OffsetNumber	lovOffset;
+	bool			blockNull, offsetNull;
+	bool			allNulls = true;
+	int 			attno;
+
+	BMTIDBuffer     buf;
+	MemSet(&buf, 0, sizeof(buf));
+
+	/* Check if the values of given attributes are all NULL. */
+	for (attno = 0; attno < tupDesc->natts; attno++)
+	{
+		if (!nulls[attno])
+		{
+			allNulls = false;
+			break;
+		}
+	}
+
+	/*
+	 * if the inserting tuple has the value NULL, then the LOV item is
+	 * the first item in the lovBuffer.
+	 */
+	if (allNulls)
+	{
+		lovBlock = BM_LOV_STARTPAGE;
+		lovOffset = 1;
+	}
+	else
+	{
+ 		bool res = false;
+		
+		/*
+		 * Search through the lov heap and index to find the LOV item which
+		 * has the same value as the inserting tuple. If such an item is
+		 * not found, then we create a new LOV item, and insert it into the
+		 * lov heap and index.
+		 */
+
+		/*
+		 * XXX: We lock the meta page to guarantee that only one writer
+		 * will create a new lovItem at once. However, this does not
+		 * guard against a race condition where a concurrent writer is
+		 * inserting the same key as us. So we do another search with
+		 * SnapshotDirty. If such a key is found, we have to wait for
+		 * the other guy, and try again. However, this may cause
+		 * distributed deadlock (see MPP-3155). The fix is to use
+		 * FrozenTransactionId for tuples in the LOV heap so that
+		 * all tuples are always visible to any transactions.
+		 *
+		 * The problem is, locking the metapage is pretty heavy handed 
+		 * because the read routines need a read lock on it. There are a
+		 * few other things we could do instead: use a BM insert lock or
+		 * wrap the code below in a PG_TRY and try and catch the unique
+		 * constraint violation from the btree code.
+		 */
+
+		LockBuffer(metabuf, BM_WRITE);
+		
+		res = _bitmap_findvalue(lovHeap, lovIndex, scanKey, scanDesc, &lovBlock,
+								&blockNull, &lovOffset, &offsetNull);
+
+		if(!res)
+		{
+			create_lovitem(rel, metabuf, tidnum, tupDesc,
+						   attdata, nulls, lovHeap, lovIndex,
+						   &lovBlock, &lovOffset, use_wal);
+		}
+		LockBuffer(metabuf, BUFFER_LOCK_UNLOCK);
+	}
+
+	/*
+	 * Here, we have found the block number and offset number of the
+	 * LOV item that points to the bitmap page, to which we will
+	 * append the set bit.
+	 */
+
+	insertsetbit(rel, lovBlock, lovOffset, tidnum, &buf, use_wal);
+
+	_bitmap_free_tidbuf(&buf);
 }
