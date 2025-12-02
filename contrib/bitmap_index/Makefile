@@ -3,7 +3,9 @@ MODULE_big = bitmap_index
 OBJS = \
     src/bitmap.o \
     src/bitmappages.o \
-    src/bitmapinsert.o
+    src/bitmapinsert.o \
+    src/bitmapattutil.o \
+    src/bitmaputil.o
 
 
 EXTENSION = bitmap_index

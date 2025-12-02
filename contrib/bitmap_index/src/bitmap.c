@@ -60,7 +60,7 @@ bmhandler(PG_FUNCTION_ARGS)
 	amroutine->amkeytype = InvalidOid;
 
 	amroutine->ambuild = bmbuild;
-	amroutine->ambuildempty = bmbuildempty;
+	//amroutine->ambuildempty = bmbuildempty;
 	amroutine->aminsert = bminsert;
 	// amroutine->ambulkdelete = bmbulkdelete;
 	// amroutine->amvacuumcleanup = bmvacuumcleanup;

@@ -15,7 +15,7 @@
 #ifndef BITMAP_PRIVATE_H
 #define BITMAP_PRIVATE_H
 
-#include "access/bitmap.h"
+#include "bitmap.h"
 #include "access/genam.h"
 #include "access/htup.h"
 #include "utils/hsearch.h"
