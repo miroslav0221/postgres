@@ -1,0 +1,7 @@
+# bitmap_index extension
+comment = 'Greenplum Bitmap Index as an extension for PostgreSQL'
+default_version = '1.0'
+relocatable = true
+module_pathname = '$libdir/bitmap_index'
+
+
