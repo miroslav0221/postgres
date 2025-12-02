@@ -2421,3 +2421,145 @@ inserttuple(Relation rel, Buffer metabuf, uint64 tidnum,
 
 	_bitmap_free_tidbuf(&buf);
 }
+
+/*
+ * insertsetbit() -- insert a given set bit into a bitmap
+ * 	specified by lovBlock and lovOffset.
+ */
+static void
+insertsetbit(Relation rel, BlockNumber lovBlock, OffsetNumber lovOffset,
+			 uint64 tidnum, BMTIDBuffer *buf, bool use_wal)
+{
+	Buffer lovBuffer;
+	Page		lovPage;
+	BMLOVItem	lovItem;
+
+	lovBuffer = _bitmap_getbuf(rel, lovBlock, BM_WRITE);
+	lovPage = BufferGetPage(lovBuffer);
+	lovItem = (BMLOVItem) PageGetItem(lovPage, 
+									  PageGetItemId(lovPage, lovOffset));
+
+	buf->last_compword = lovItem->bm_last_compword;
+	buf->last_word = lovItem->bm_last_word;
+	buf->is_last_compword_fill = (lovItem->lov_words_header >= 2);
+	buf->last_tid = lovItem->bm_last_setbit;
+	MemSet(buf->hwords, 0, BM_NUM_OF_HEADER_WORDS * sizeof(BM_HRL_WORD));
+	if (buf->cwords)
+	{
+		MemSet(buf->cwords, 0,
+				buf->num_cwords * sizeof(BM_HRL_WORD));
+	}
+	if (buf->last_tids)
+		MemSet(buf->last_tids, 0,
+				buf->num_cwords * sizeof(uint64));
+	buf->curword = 0;
+
+	/*
+	 * Usually, tidnum is greater than lovItem->bm_last_setbit.
+	 * However, if this is not the case, this should be called while
+	 * doing 'vacuum full' or doing insertion after 'vacuum'. In this
+	 * case, we try to update this bit in the corresponding bitmap
+	 * vector.
+	 */
+	if (tidnum <= lovItem->bm_last_setbit)
+	{
+		/*
+		 * Scan through the bitmap vector, and update the bit in
+		 * tidnum.
+		 */
+		updatesetbit(rel, lovBuffer, lovOffset, tidnum, use_wal);
+
+		_bitmap_relbuf(lovBuffer);
+		return;
+	}
+
+	/*
+	 * To insert this new set bit, we also need to add all zeros between
+	 * this set bit and last set bit. We construct all new words here.
+	 */
+	buf_add_tid_with_fill(rel, buf, lovBuffer, lovOffset, tidnum, use_wal);
+	
+	/*
+	 * If there are only updates to the last bitmap complete word and
+	 * last bitmp word, we simply needs to update the lov buffer.
+	 */
+	if (buf->num_cwords == 0)
+	{
+		START_CRIT_SECTION();
+
+		MarkBufferDirty(lovBuffer);
+
+		lovItem->bm_last_compword = buf->last_compword;
+		lovItem->bm_last_word = buf->last_word;
+		lovItem->lov_words_header =
+			(buf->is_last_compword_fill) ? 2 : 0;
+		lovItem->bm_last_setbit = tidnum;
+		lovItem->bm_last_tid_location = tidnum - tidnum % BM_HRL_WORD_SIZE;
+
+		if (use_wal)
+			_bitmap_log_bitmap_lastwords
+				(rel, lovBuffer, lovOffset, lovItem);
+		
+		END_CRIT_SECTION();
+
+		// if (Debug_bitmap_print_insert)
+		// 	elog(LOG, "Bitmap Insert: insert to last two words"
+		// 		 ", bm_last_setbit=" INT64_FORMAT
+		// 		 ", bm_last_tid_location=" INT64_FORMAT
+		// 		 ", idxrelid=%u",
+		// 		 lovItem->bm_last_setbit,
+		// 		 lovItem->bm_last_tid_location,
+		// 		 RelationGetRelid(rel));
+ 		
+		_bitmap_relbuf(lovBuffer);
+		
+		return;
+	}
+
+	/*
+	 * Write bitmap words to bitmap pages. When there are no enough
+	 * space for all these bitmap words, new bitmap pages are created.
+	 */
+	_bitmap_write_new_bitmapwords(rel, lovBuffer, lovOffset,
+								  buf, use_wal);
+	_bitmap_relbuf(lovBuffer);
+}
+
+/*
+ * _bitmap_write_alltids() -- write all tids in the given buffer into disk.
+ */
+void
+_bitmap_write_alltids(Relation rel, BMTidBuildBuf *tids, 
+					  bool use_wal)
+{
+	ListCell *cell;
+
+	foreach(cell, tids->lov_blocks)
+	{
+		int i;
+		BMTIDLOVBuffer *lov_buf = (BMTIDLOVBuffer *)lfirst(cell);
+		BlockNumber lov_block = lov_buf->lov_block;
+
+		for (i = 0; i < BM_MAX_LOVITEMS_PER_PAGE; i++)
+		{
+			BMTIDBuffer *buf = (BMTIDBuffer *)lov_buf->bufs[i];
+			OffsetNumber off;
+
+			CHECK_FOR_INTERRUPTS();
+
+			if (!buf || buf->num_cwords == 0)
+				continue;
+
+			off = i + 1;
+
+			buf_free_mem(rel, buf, lov_block, off, use_wal);
+
+			pfree(buf);
+
+			lov_buf->bufs[i] = NULL;
+		}
+	}
+	list_free_deep(tids->lov_blocks);
+	tids->lov_blocks = NIL;
+	tids->byte_size = 0;
+}

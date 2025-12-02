@@ -169,3 +169,222 @@ _bitmap_insert_lov(Relation lovHeap, Relation lovIndex, Datum *datum,
 
     heap_freetuple(tuple);
 }
+
+void
+_bitmap_create_lov_heapandindex(Relation rel,
+								Oid *lovHeapOid,
+								Oid *lovIndexOid)
+{
+	char		lovHeapName[NAMEDATALEN];
+	char		lovIndexName[NAMEDATALEN];
+	TupleDesc	tupDesc;
+	IndexInfo  *indexInfo;
+	List	   *indexColNames;
+	ObjectAddress	objAddr, referenced;
+	Oid		   *classObjectId;
+	int16	   *coloptions;
+	Oid		   *colcollations;
+	Oid			heapid;
+	Oid			idxid;
+	int			indattrs;
+	int			i;
+	Relation	lov_heap_rel;
+	Oid			namespaceid;
+
+	Assert(rel != NULL);
+
+	/* create the new names for the new lov heap and index */
+	snprintf(lovHeapName, sizeof(lovHeapName),
+			 "pg_bm_%u", RelationGetRelid(rel));
+	snprintf(lovIndexName, sizeof(lovIndexName),
+			 "pg_bm_%u_index", RelationGetRelid(rel));
+
+	/*
+	 * The LOV heap and index go in special pg_bitmapindex schema. Those for
+	 * temp relations go into the per-backend temp-toast-table namespace,
+	 * however!
+	 */
+	if (RelationUsesTempNamespace(rel))
+		namespaceid = GetTempToastNamespace();
+	else
+		namespaceid = PG_BITMAPINDEX_NAMESPACE;
+
+	heapid = get_relname_relid(lovHeapName, namespaceid);
+
+	/*
+	 * If heapid exists, then this is happening during re-indexing.
+	 * We allocate new relfilenodes for lov heap and lov index.
+	 *
+	 * XXX Each segment db may have different relfilenodes for lov heap and
+	 * lov index, which should not be an issue now. Ideally, we would like each
+	 * segment db use the same oids.
+	 */
+	if (OidIsValid(heapid))
+	{
+		Relation lovHeap;
+		Relation lovIndex;
+		Buffer btree_metabuf;
+		Page   btree_metapage;
+
+		*lovHeapOid = heapid;
+
+		idxid = get_relname_relid(lovIndexName, namespaceid);
+		Assert(OidIsValid(idxid));
+		*lovIndexOid = idxid;
+
+		lovHeap = heap_open(heapid, AccessExclusiveLock);
+		lovIndex = index_open(idxid, AccessExclusiveLock);
+
+		RelationSetNewRelfilenode(lovHeap, lovHeap->rd_rel->relpersistence);
+		RelationSetNewRelfilenode(lovIndex, lovIndex->rd_rel->relpersistence);
+
+		/*
+		 * After creating the new relfilenode for a btee index, this is not
+		 * a btree anymore. We create the new metapage for this btree.
+		 */
+		btree_metabuf = _bt_getbuf(lovIndex, P_NEW, BT_WRITE);
+		Assert (BTREE_METAPAGE == BufferGetBlockNumber(btree_metabuf));
+		btree_metapage = BufferGetPage(btree_metabuf);
+		_bt_initmetapage(btree_metapage, P_NONE, 0, _bt_allequalimage(lovIndex, true));
+
+		/* XLOG the metapage */
+
+		if (RelationNeedsWAL(lovIndex))
+		{
+			START_CRIT_SECTION();
+			MarkBufferDirty(btree_metabuf);
+			log_newpage_buffer(btree_metabuf, true);
+			END_CRIT_SECTION();
+		}
+
+		/* This cache value is not valid anymore. */
+		if (lovIndex->rd_amcache)
+		{
+			pfree(lovIndex->rd_amcache);
+			lovIndex->rd_amcache = NULL;
+		}
+		MarkBufferDirty(btree_metabuf);
+		_bt_relbuf(lovIndex, btree_metabuf);
+
+		index_close(lovIndex, NoLock);
+		heap_close(lovHeap, NoLock);
+
+		return;
+	}
+
+	/*
+	 * create a new empty heap to store all attribute values with their
+	 * corresponding block number and offset in LOV.
+	 */
+	tupDesc = _bitmap_create_lov_heapTupleDesc(rel);
+
+	Assert(rel->rd_rel != NULL);
+
+  	heapid =
+		heap_create_with_catalog(lovHeapName,
+								 namespaceid,
+								 rel->rd_rel->reltablespace,
+								 InvalidOid,
+								 InvalidOid,
+								 InvalidOid,
+								 rel->rd_rel->relowner,
+								 HEAP_TABLE_AM_OID,
+								 tupDesc, NIL,
+								 RELKIND_RELATION,
+								 rel->rd_rel->relpersistence,
+								 rel->rd_rel->relisshared,
+								 false, /* mapped_relation */
+								 ONCOMMIT_NOOP, NULL /* GP Policy */,
+								 (Datum)0, false, true,
+								 true, /* is_internal */
+								 InvalidOid, /* relrewrite */
+								 NULL, /* typeaddress */
+								 /* valid_opts */ true);
+	*lovHeapOid = heapid;
+
+	/*
+	 * We must bump the command counter to make the newly-created relation
+	 * tuple visible for opening.
+	 */
+	CommandCounterIncrement();
+
+	/* ShareLock is not really needed here, but take it anyway */
+	lov_heap_rel = heap_open(heapid, ShareLock);
+
+	objAddr.classId = RelationRelationId;
+	objAddr.objectId = heapid;
+	objAddr.objectSubId = 0 ;
+
+	referenced.classId = RelationRelationId;
+	referenced.objectId = RelationGetRelid(rel);
+	referenced.objectSubId = 0;
+
+	recordDependencyOn(&objAddr, &referenced, DEPENDENCY_INTERNAL);
+
+	/*
+	 * create a btree index on the newly-created heap.
+	 * The key includes all attributes to be indexed in this bitmap index.
+	 */
+	indattrs = tupDesc->natts - 2;
+	indexInfo = makeNode(IndexInfo);
+	indexInfo->ii_NumIndexAttrs = indattrs;
+	indexInfo->ii_NumIndexKeyAttrs = indattrs;
+	indexInfo->ii_Expressions = NIL;
+	indexInfo->ii_ExpressionsState = NIL;
+	indexInfo->ii_Predicate = NIL;
+	indexInfo->ii_PredicateState = NULL;
+	indexInfo->ii_ExclusionOps = NULL;
+	indexInfo->ii_ExclusionProcs = NULL;
+	indexInfo->ii_ExclusionStrats = NULL;
+	indexInfo->ii_Unique = true;
+	indexInfo->ii_ReadyForInserts = true;
+	indexInfo->ii_Concurrent = false;
+	indexInfo->ii_BrokenHotChain = false;
+	/*
+	 * CBDB_PARALLEL_FIXME: temporarily set ii_ParallelWorkers to -1 to disable parallel in bitmap index
+	 * building. That's because that we still hold InterruptHoldoffCount after launch parallel workers.
+	 * And when parallel workers detach the message 'X' is not interrupt the leader. However, the leader
+	 * must wait for workers detaching. Thus there will be a hang issue.
+	 *
+	 * We should bring it back in the future.
+	 */
+	indexInfo->ii_ParallelWorkers = -1;
+	indexInfo->ii_Am = BTREE_AM_OID;
+	indexInfo->ii_AmCache = NULL;
+	indexInfo->ii_Context = CurrentMemoryContext;
+
+	classObjectId = (Oid *) palloc(indattrs * sizeof(Oid));
+	coloptions = (int16 *) palloc(indattrs * sizeof(int16));
+	colcollations = (Oid *) palloc(indattrs * sizeof(Oid));
+	indexColNames = NIL;
+	for (i = 0; i < indattrs; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupDesc, i);
+
+		indexInfo->ii_IndexAttrNumbers[i] = i + 1;
+		classObjectId[i] = GetDefaultOpClass(attr->atttypid, BTREE_AM_OID);
+		coloptions[i] = 0;
+		colcollations[i] = rel->rd_indcollation[i];
+
+		indexColNames = lappend(indexColNames, NameStr(attr->attname));
+	}
+
+	idxid = index_create(lov_heap_rel, lovIndexName, InvalidOid,
+						 InvalidOid,
+						 InvalidOid,
+						 InvalidOid,
+						 indexInfo,
+						 indexColNames,
+						 BTREE_AM_OID,
+						 rel->rd_rel->reltablespace,
+						 colcollations,
+						 classObjectId, coloptions, (Datum) 0,
+						 INDEX_CREATE_IF_NOT_EXISTS, /* flags */
+						 0, /* constr_flags */
+						 /* allow_system_table_mods */ true,
+						 /* is_internal */ true,
+						 NULL);
+	*lovIndexOid = idxid;
+
+	heap_close(lov_heap_rel, NoLock);
+}
