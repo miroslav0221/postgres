@@ -204,10 +204,11 @@ _bitmap_create_lov_heapandindex(Relation rel,
 	 * temp relations go into the per-backend temp-toast-table namespace,
 	 * however!
 	 */
-	if (RelationUsesTempNamespace(rel))
+	if (RelationIsPermanent(rel))
 		namespaceid = GetTempToastNamespace();
 	else
-		namespaceid = PG_BITMAPINDEX_NAMESPACE;
+//		namespaceid = PG_BITMAPINDEX_NAMESPACE;
+        namespaceid = rel->rd_rel->relnamespace;
 
 	heapid = get_relname_relid(lovHeapName, namespaceid);
 
@@ -294,12 +295,11 @@ _bitmap_create_lov_heapandindex(Relation rel,
 								 rel->rd_rel->relpersistence,
 								 rel->rd_rel->relisshared,
 								 false, /* mapped_relation */
-								 ONCOMMIT_NOOP, NULL /* GP Policy */,
+								 ONCOMMIT_NOOP,
 								 (Datum)0, false, true,
 								 true, /* is_internal */
 								 InvalidOid, /* relrewrite */
-								 NULL, /* typeaddress */
-								 /* valid_opts */ true);
+								 NULL /* typeaddress */);
 	*lovHeapOid = heapid;
 
 	/*
@@ -378,7 +378,11 @@ _bitmap_create_lov_heapandindex(Relation rel,
 						 BTREE_AM_OID,
 						 rel->rd_rel->reltablespace,
 						 colcollations,
-						 classObjectId, coloptions, (Datum) 0,
+						 classObjectId,
+                         NULL,
+                         coloptions,
+                         NULL,
+                         (Datum) 0,
 						 INDEX_CREATE_IF_NOT_EXISTS, /* flags */
 						 0, /* constr_flags */
 						 /* allow_system_table_mods */ true,
