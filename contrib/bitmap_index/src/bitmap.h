@@ -327,7 +327,7 @@ typedef BMBitmapData *BMBitmap;
  * See src/backend/access/bitmap/README for more details
  */
 static inline bool
-IS_FILL_WORD(const BM_HRL_WORD *words, int16 wordno)
+ISa(const BM_HRL_WORD *words, int16 wordno)
 {
 	return (words[wordno / BM_HRL_WORD_SIZE] & WORDNO_GET_HEADER_BIT(wordno)) > 0;
 }

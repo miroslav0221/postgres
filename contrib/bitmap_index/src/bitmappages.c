@@ -395,8 +395,8 @@ _bitmap_init(Relation indexrel, bool use_wal, bool for_empty)
 	metapage->bm_lov_heapId = lovHeapOid;
 	metapage->bm_lov_indexId = lovIndexOid;
 
-	if (use_wal)
-		_bitmap_log_metapage(indexrel, fork, page);
+	// if (use_wal)
+	// 	_bitmap_log_metapage(indexrel, fork, page);
 
 	/* allocate the first LOV page. */
 	buf = ReadBufferExtended(indexrel, fork, P_NEW, RBM_NORMAL, NULL);
@@ -426,8 +426,8 @@ _bitmap_init(Relation indexrel, bool use_wal, bool for_empty)
 
 	metapage->bm_lov_lastpage = BufferGetBlockNumber(buf);
 
-	if(use_wal)
-		_bitmap_log_lovitem(indexrel, fork, buf, newOffset, lovItem, metabuf, true);
+	// if(use_wal)
+	// 	_bitmap_log_lovitem(indexrel, fork, buf, newOffset, lovItem, metabuf, true);
 
 	END_CRIT_SECTION();
 
