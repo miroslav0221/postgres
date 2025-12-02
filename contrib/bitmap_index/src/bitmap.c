@@ -145,3 +145,17 @@ bmbuildCallback(Relation index, ItemPointer tupleId, Datum *attdata,
 	if (((int)bstate->ituples) % 1000 == 0)
 		CHECK_FOR_INTERRUPTS();
 }
+
+/*
+ * bminsert() -- insert an index tuple into a bitmap index.
+ */
+bool
+bminsert(Relation rel, Datum *values, bool *isnull,
+         ItemPointer ht_ctid, Relation heapRel,
+         IndexUniqueCheck checkUnique,
+         bool indexUnchanged,
+         IndexInfo *indexInfo)
+{
+    _bitmap_doinsert(rel, *ht_ctid, values, isnull);
+    return true;
+}
