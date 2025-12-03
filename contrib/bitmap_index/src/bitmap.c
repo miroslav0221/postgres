@@ -33,6 +33,18 @@ static void bmbuildCallback(Relation index,	ItemPointer tupleId, Datum *attdata,
 							bool *nulls, bool tupleIsAlive,	void *state);
 
 
+void
+bmcostestimate(struct PlannerInfo *root,
+               struct IndexPath *path,
+               double loop_count,
+               Cost *indexStartupCost,
+               Cost *indexTotalCost,
+               Selectivity *indexSelectivity,
+               double *indexCorrelation,
+               double *indexPages)
+{
+}
+
 /*
  * Bitmap index handler function: return IndexAmRoutine with access method parameters
  * and callbacks.
@@ -62,20 +74,20 @@ bmhandler(PG_FUNCTION_ARGS)
 	amroutine->ambuild = bmbuild;
 	amroutine->ambuildempty = bmbuildempty;
 	amroutine->aminsert = bminsert;
-	// amroutine->ambulkdelete = bmbulkdelete;
-	// amroutine->amvacuumcleanup = bmvacuumcleanup;
+	 amroutine->ambulkdelete = bmbulkdelete;
+	 amroutine->amvacuumcleanup = bmvacuumcleanup;
 	amroutine->amcanreturn = NULL;
-	// amroutine->amcostestimate = bmcostestimate;
-	// amroutine->amoptions = bmoptions;
+	 amroutine->amcostestimate = bmcostestimate;
+	 amroutine->amoptions = bmoptions;
 	amroutine->amproperty = NULL;
-	// amroutine->amvalidate = bmvalidate;
-	// amroutine->ambeginscan = bmbeginscan;
-	// amroutine->amrescan = bmrescan;
-	// amroutine->amgettuple = bmgettuple;
-	// amroutine->amgetbitmap = bmgetbitmap;
-	// //amroutine->amendscan = bmendscan;
-	// amroutine->ammarkpos = bmmarkpos;
-	// amroutine->amrestrpos = bmrestrpos;
+	 amroutine->amvalidate = bmvalidate;
+	 amroutine->ambeginscan = bmbeginscan;
+	 amroutine->amrescan = bmrescan;
+	 amroutine->amgettuple = bmgettuple;
+	 amroutine->amgetbitmap = bmgetbitmap;
+	 amroutine->amendscan = bmendscan;
+	 amroutine->ammarkpos = bmmarkpos;
+	 amroutine->amrestrpos = bmrestrpos;
 
 	PG_RETURN_POINTER(amroutine);
 }
@@ -120,7 +132,7 @@ bmbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 									   NULL);
 	/* clean up the build state */
 	_bitmap_cleanup_buildstate(index, &bmstate);
-	
+
 	/* return statistics */
 	result = (IndexBuildResult *) palloc0(sizeof(IndexBuildResult));
 
@@ -178,12 +190,12 @@ bminsert(Relation rel, Datum *values, bool *isnull,
  * is hidden away inside the metadata page of the index.  Future versions should
  * move this information into the catalog.
  */
-void 
+void
 GetBitmapIndexAuxOids(Relation index, Oid *heapId, Oid *indexId)
 {
 	Buffer     metabuf;
 	BMMetaPage metapage;
-	
+
 
 	/* Only Bitmap Indexes have bitmap related sub-objects */
 	// if (!RelationIsBitmapIndex(index))
@@ -192,7 +204,7 @@ GetBitmapIndexAuxOids(Relation index, Oid *heapId, Oid *indexId)
 	// 	*indexId = InvalidOid;
 	// 	return;
 	// }
-	
+
 	metabuf = _bitmap_getbuf(index, BM_METAPAGE, BM_READ);
 	metapage = _bitmap_get_metapage_data(index, metabuf);
 
@@ -200,4 +212,145 @@ GetBitmapIndexAuxOids(Relation index, Oid *heapId, Oid *indexId)
 	*indexId = metapage->bm_lov_indexId;
 
 	_bitmap_relbuf(metabuf);
+}
+
+/*
+ * bmvacuumcleanup() -- post-vacuum cleanup.
+ *
+ * We do nothing useful here.
+ */
+IndexBulkDeleteResult *
+bmvacuumcleanup(IndexVacuumInfo *info,
+                IndexBulkDeleteResult *stats)
+{
+    Relation	rel = info->index;
+
+    if(stats == NULL)
+        stats = (IndexBulkDeleteResult *)palloc0(sizeof(IndexBulkDeleteResult));
+
+    /* update statistics */
+    stats->num_pages = RelationGetNumberOfBlocks(rel);
+    stats->pages_deleted = 0;
+    stats->pages_free = 0;
+    /* XXX: dodgy hack to shutup index_scan() and vacuum_index() */
+    stats->num_index_tuples = info->num_heap_tuples;
+
+    return stats;
+}
+
+/*
+ * bmbulkdelete() -- bulk delete index entries
+ *
+ * Re-index is performed before retrieving the number of tuples
+ * indexed in this index.
+ */
+IndexBulkDeleteResult *
+bmbulkdelete(IndexVacuumInfo *info,
+             IndexBulkDeleteResult *stats,
+             IndexBulkDeleteCallback callback,
+             void *callback_state)
+{
+    return stats;
+}
+
+bytea *
+bmoptions(Datum reloptions, bool validate)
+{
+//    return default_reloptions(reloptions, validate, RELOPT_KIND_BITMAP);
+    return (bytea *)1;
+}
+
+/*
+ * Ask appropriate access method to validate the specified opclass.
+ */
+bool
+bmvalidate(Oid opclassoid)
+{
+    /*
+     * Bitmap indexes use the same opclass support functions and strategies
+     * as B-tree indexes. In fact, we use a real B-tree index for the LOV
+     * tree. So borrow B-tree's validate function.
+     */
+//    return btree_or_bitmap_validate(opclassoid, "bitmap");
+    return true;
+}
+
+/*
+ * bmbeginscan() -- start a scan on the bitmap index.
+ */
+IndexScanDesc
+bmbeginscan(Relation rel, int nkeys, int norderbys)
+{
+    IndexScanDesc scan;
+    BMScanOpaque	so;
+
+    /* no order by operators allowed */
+    Assert(norderbys == 0);
+
+    /* get the scan */
+    scan = RelationGetIndexScan(rel, nkeys, norderbys);
+
+    /* allocate private workspace */
+    so = (BMScanOpaque) palloc(sizeof(BMScanOpaqueData));
+    so->bm_currPos = NULL;
+    so->bm_markPos = NULL;
+    so->cur_pos_valid = false;
+    so->mark_pos_valid = false;
+
+    scan->xs_itupdesc = RelationGetDescr(rel);
+
+    scan->opaque = so;
+
+    return scan;
+}
+
+/*
+ * bmrescan() -- restart a scan on the bitmap index.
+ */
+void
+bmrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
+         ScanKey orderbys, int norderbys)
+{
+}
+
+/*
+ * bmgettuple() -- return the next tuple in a scan.
+ */
+bool
+bmgettuple(IndexScanDesc scan, ScanDirection dir)
+{
+    return true;
+}
+
+/*
+ * bmgetbitmap() -- return a stream bitmap.
+ */
+int64
+bmgetbitmap(IndexScanDesc scan, Node **bmNodeP)
+{
+    return 1;
+}
+
+/*
+ * bmendscan() -- close a scan.
+ */
+void
+bmendscan(IndexScanDesc scan)
+{
+}
+
+/*
+ * bmmarkpos() -- save the current scan position.
+ */
+void
+bmmarkpos(IndexScanDesc scan)
+{
+}
+
+/*
+ * bmrestrpos() -- restore a scan to the last saved position.
+ */
+void
+bmrestrpos(IndexScanDesc scan)
+{
 }
