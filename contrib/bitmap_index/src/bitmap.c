@@ -60,7 +60,7 @@ bmhandler(PG_FUNCTION_ARGS)
 	amroutine->amkeytype = InvalidOid;
 
 	amroutine->ambuild = bmbuild;
-	//amroutine->ambuildempty = bmbuildempty;
+	amroutine->ambuildempty = bmbuildempty;
 	amroutine->aminsert = bminsert;
 	// amroutine->ambulkdelete = bmbulkdelete;
 	// amroutine->amvacuumcleanup = bmvacuumcleanup;
@@ -128,6 +128,16 @@ bmbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	result->index_tuples = bmstate.ituples;
 
 	return result;
+}
+
+/*
+ *	bmbuildempty() -- build an empty bitmap index in the initialization fork
+ */
+void
+bmbuildempty(Relation indexrel)
+{
+    /* initialize meta page and first LOV page for INIT_FORKNUM */
+    _bitmap_init(indexrel, true, true);
 }
 
 /*
