@@ -159,3 +159,35 @@ bminsert(Relation rel, Datum *values, bool *isnull,
     _bitmap_doinsert(rel, *ht_ctid, values, isnull);
     return true;
 }
+
+/*
+ * GetBitmapIndexAuxOids - Given an open index, fetch and return the oids for
+ * the bitmap subobjects (pg_bm_xxxx + pg_bm_xxxx_index).
+ *
+ * Note: Currently this information is not stored directly in the catalog, but
+ * is hidden away inside the metadata page of the index.  Future versions should
+ * move this information into the catalog.
+ */
+void 
+GetBitmapIndexAuxOids(Relation index, Oid *heapId, Oid *indexId)
+{
+	Buffer     metabuf;
+	BMMetaPage metapage;
+	
+
+	/* Only Bitmap Indexes have bitmap related sub-objects */
+	if (!RelationIsBitmapIndex(index))
+	{
+		*heapId = InvalidOid;
+		*indexId = InvalidOid;
+		return;
+	}
+	
+	metabuf = _bitmap_getbuf(index, BM_METAPAGE, BM_READ);
+	metapage = _bitmap_get_metapage_data(index, metabuf);
+
+	*heapId  = metapage->bm_lov_heapId;
+	*indexId = metapage->bm_lov_indexId;
+
+	_bitmap_relbuf(metabuf);
+}

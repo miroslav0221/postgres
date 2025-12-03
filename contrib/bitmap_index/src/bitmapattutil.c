@@ -170,6 +170,40 @@ _bitmap_insert_lov(Relation lovHeap, Relation lovIndex, Datum *datum,
     heap_freetuple(tuple);
 }
 
+/*
+ * _bitmap_create_lov_heapTupleDesc() -- create the new heap tuple descriptor.
+ */
+
+TupleDesc
+_bitmap_create_lov_heapTupleDesc(Relation rel)
+{
+	TupleDesc	tupDesc;
+	TupleDesc	oldTupDesc;
+	AttrNumber	attno;
+	int			natts;
+
+	oldTupDesc = RelationGetDescr(rel);
+	natts = oldTupDesc->natts + 2;
+
+	tupDesc = CreateTemplateTupleDesc(natts);
+
+	for (attno = 1; attno <= oldTupDesc->natts; attno++)
+	{
+		/* copy the attribute to be indexed. */
+		TupleDescCopyEntry(tupDesc, attno, oldTupDesc, attno);
+	}
+
+	/* the block number */
+	TupleDescInitEntry(tupDesc, attno, "blockNumber", INT4OID, -1, 0);
+	attno++;
+
+	/* the offset number */
+	TupleDescInitEntry(tupDesc, attno, "offsetNumber", INT4OID, -1, 0);
+
+	return tupDesc;
+}
+
+
 void
 _bitmap_create_lov_heapandindex(Relation rel,
 								Oid *lovHeapOid,
@@ -207,8 +241,8 @@ _bitmap_create_lov_heapandindex(Relation rel,
 	if (RelationIsPermanent(rel))
 		namespaceid = GetTempToastNamespace();
 	else
-//		namespaceid = PG_BITMAPINDEX_NAMESPACE;
-        namespaceid = rel->rd_rel->relnamespace;
+		namespaceid = 7012;
+        // namespaceid = rel->rd_rel->relnamespace;
 
 	heapid = get_relname_relid(lovHeapName, namespaceid);
 
@@ -236,8 +270,8 @@ _bitmap_create_lov_heapandindex(Relation rel,
 		lovHeap = heap_open(heapid, AccessExclusiveLock);
 		lovIndex = index_open(idxid, AccessExclusiveLock);
 
-		RelationSetNewRelfilenode(lovHeap, lovHeap->rd_rel->relpersistence);
-		RelationSetNewRelfilenode(lovIndex, lovIndex->rd_rel->relpersistence);
+		RelationSetNewRelfilenumber(lovHeap, lovHeap->rd_rel->relpersistence);
+		RelationSetNewRelfilenumber(lovIndex, lovIndex->rd_rel->relpersistence);
 
 		/*
 		 * After creating the new relfilenode for a btee index, this is not
@@ -250,13 +284,13 @@ _bitmap_create_lov_heapandindex(Relation rel,
 
 		/* XLOG the metapage */
 
-		if (RelationNeedsWAL(lovIndex))
-		{
-			START_CRIT_SECTION();
-			MarkBufferDirty(btree_metabuf);
-			log_newpage_buffer(btree_metabuf, true);
-			END_CRIT_SECTION();
-		}
+		// if (RelationNeedsWAL(lovIndex))
+		// {
+		// 	START_CRIT_SECTION();
+		// 	MarkBufferDirty(btree_metabuf);
+		// 	log_newpage_buffer(btree_metabuf, true);
+		// 	END_CRIT_SECTION();
+		// }
 
 		/* This cache value is not valid anymore. */
 		if (lovIndex->rd_amcache)
