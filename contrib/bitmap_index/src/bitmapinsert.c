@@ -2496,9 +2496,9 @@ insertsetbit(Relation rel, BlockNumber lovBlock, OffsetNumber lovOffset,
 		lovItem->bm_last_setbit = tidnum;
 		lovItem->bm_last_tid_location = tidnum - tidnum % BM_HRL_WORD_SIZE;
 
-		if (use_wal)
-			_bitmap_log_bitmap_lastwords
-				(rel, lovBuffer, lovOffset, lovItem);
+		// if (use_wal)
+		// 	_bitmap_log_bitmap_lastwords
+		// 		(rel, lovBuffer, lovOffset, lovItem);
 		
 		END_CRIT_SECTION();
 
