@@ -318,6 +318,25 @@ typedef BMBitmapData *BMBitmap;
 #define BM_INT_GET_OFFSET(i) \
 	(((i - 1) % BM_MAX_TUPLES_PER_PAGE) + 1)
 
+
+
+
+
+/*
+ * To see if the content word at wordno is a compressed word or not we must look
+ * in the header words. Each bit in the header words corresponds to a word
+ * amongst the content words. If the bit is 1, the word is compressed (i.e., it
+ * is a fill word) otherwise it is uncompressed.
+ *
+ * See src/backend/access/bitmap/README for more details
+ */
+static inline bool
+IS_FILL_WORD(const BM_HRL_WORD *words, int16 wordno)
+{
+	return (words[wordno / BM_HRL_WORD_SIZE] & WORDNO_GET_HEADER_BIT(wordno)) > 0;
+}
+
+
 /*
  * To see if the content word at wordno is a compressed word or not we must look
  * in the header words. Each bit in the header words corresponds to a word

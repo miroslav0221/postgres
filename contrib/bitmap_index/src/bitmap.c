@@ -176,12 +176,12 @@ GetBitmapIndexAuxOids(Relation index, Oid *heapId, Oid *indexId)
 	
 
 	/* Only Bitmap Indexes have bitmap related sub-objects */
-	if (!RelationIsBitmapIndex(index))
-	{
-		*heapId = InvalidOid;
-		*indexId = InvalidOid;
-		return;
-	}
+	// if (!RelationIsBitmapIndex(index))
+	// {
+	// 	*heapId = InvalidOid;
+	// 	*indexId = InvalidOid;
+	// 	return;
+	// }
 	
 	metabuf = _bitmap_getbuf(index, BM_METAPAGE, BM_READ);
 	metapage = _bitmap_get_metapage_data(index, metabuf);
