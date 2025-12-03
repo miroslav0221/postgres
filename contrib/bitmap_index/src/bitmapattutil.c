@@ -243,8 +243,9 @@ _bitmap_create_lov_heapandindex(Relation rel,
 	if (RelationIsPermanent(rel))
 		namespaceid = GetTempToastNamespace();
 	else
-		namespaceid = 7012;
-        // namespaceid = rel->rd_rel->relnamespace;
+		// namespaceid = 7012;
+		// namespaceid = PG_BITMAPINDEX_NAMESPACE;
+        namespaceid = rel->rd_rel->relnamespace;
 
 	heapid = get_relname_relid(lovHeapName, namespaceid);
 
