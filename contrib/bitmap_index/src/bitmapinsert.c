@@ -1395,8 +1395,8 @@ updatesetbit_inpage(Relation rel, uint64 tidnum,
 
 		bitmap->cwords[wordNo] |= (((BM_HRL_WORD)1)<<insertingPos);
 
-		if (use_wal)
-			_bitmap_log_updateword(rel, bitmapBuffer, wordNo);
+		// if (use_wal)
+		// 	_bitmap_log_updateword(rel, bitmapBuffer, wordNo);
 
 		END_CRIT_SECTION();
 		
@@ -1480,8 +1480,8 @@ updatesetbit_inpage(Relation rel, uint64 tidnum,
 		Assert(IS_FILL_WORD(new_words.hwords, 0) ==
 			   IS_FILL_WORD(bitmap->hwords, wordNo));
 
-		if (use_wal)
-			_bitmap_log_updateword(rel, bitmapBuffer, wordNo);
+		// if (use_wal)
+		// 	_bitmap_log_updateword(rel, bitmapBuffer, wordNo);
 
 		END_CRIT_SECTION();
 
@@ -1667,13 +1667,13 @@ updatesetbit_inpage(Relation rel, uint64 tidnum,
 		memcpy(nextBitmap->hwords, words.hwords,
 			   BM_CALC_H_WORDS(nextOpaque->bm_hrl_words_used) * sizeof(BM_HRL_WORD));
 
-		SIMPLE_FAULT_INJECTOR("rearrange_word_to_next_bitmap_page");
+		// SIMPLE_FAULT_INJECTOR("rearrange_word_to_next_bitmap_page");
 		Assert(new_words.curword == 0);
 	}
 
-	if (use_wal)
-		_bitmap_log_updatewords(rel, lovBuffer, lovOffset,
-								bitmapBuffer, nextBuffer, new_lastpage);
+	// if (use_wal)
+	// 	_bitmap_log_updatewords(rel, lovBuffer, lovOffset,
+	// 							bitmapBuffer, nextBuffer, new_lastpage);
 
 	END_CRIT_SECTION();
 
