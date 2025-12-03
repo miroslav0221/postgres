@@ -1330,7 +1330,8 @@ updatesetbit_inpage(Relation rel, uint64 tidnum,
 	bitmapPage = BufferGetPage(bitmapBuffer);
 	bitmapOpaque = (BMBitmapOpaque)PageGetSpecialPointer(bitmapPage);
 
-	bitmap = (BMBitmap) PageGetContentsMaxAligned(bitmapPage);
+//    bitmap = (BMBitmap) PageGetContentsMaxAligned(bitmapPage);
+    bitmap = (BMBitmap) ((char *) MAXALIGN(&((PageHeader) (bitmapPage))->pd_linp[0]));
 	bitNo = 0;
 
 	// if (Debug_bitmap_print_insert)
@@ -1628,7 +1629,8 @@ updatesetbit_inpage(Relation rel, uint64 tidnum,
 	{
 		nextPage = BufferGetPage(nextBuffer);
 		nextOpaque = (BMBitmapOpaque)PageGetSpecialPointer(nextPage);
-		nextBitmap = (BMBitmap)PageGetContentsMaxAligned(nextPage);
+//		nextBitmap = (BMBitmap)PageGetContentsMaxAligned(nextPage);
+        nextBitmap = (BMBitmap)((char *) MAXALIGN(&((PageHeader) (nextPage))->pd_linp[0]));
 
 		nextOpaque->bm_last_tid_location = bitmapOpaque->bm_last_tid_location;
 		nextOpaque->bm_bitmap_next = bitmapOpaque->bm_bitmap_next;
@@ -1642,7 +1644,8 @@ updatesetbit_inpage(Relation rel, uint64 tidnum,
 	{
 		nextPage = BufferGetPage(nextBuffer);
 		nextOpaque = (BMBitmapOpaque)PageGetSpecialPointer(nextPage);
-		nextBitmap = (BMBitmap)PageGetContentsMaxAligned(nextPage);
+//		nextBitmap = (BMBitmap)PageGetContentsMaxAligned(nextPage);
+        nextBitmap = (BMBitmap)((char *) MAXALIGN(&((PageHeader) (nextPage))->pd_linp[0]));
 
 		/* Create the buffer for the original words */
 		MemSet(&words, 0, sizeof(words));
@@ -1831,7 +1834,9 @@ _bitmap_write_bitmapwords_on_page(Page bitmapPage, BMTIDBuffer *buf, int startWo
 								  xl_bm_bitmapwords_perpage *xlrec_perpage)
 {
 	BMBitmapOpaque	bitmapPageOpaque = (BMBitmapOpaque)PageGetSpecialPointer(bitmapPage);
-	BMBitmap		bitmap = (BMBitmap) PageGetContentsMaxAligned(bitmapPage);
+//    BMBitmap		bitmap = (BMBitmap) PageGetContentsMaxAligned(bitmapPage);
+    BMBitmap		bitmap = (BMBitmap) ((char *) MAXALIGN(&((PageHeader) (bitmapPage))->pd_linp[0]));
+
 	uint64			cwords;
 	uint64 			words_written;
 	uint64			start_hword_no, end_hword_no;
