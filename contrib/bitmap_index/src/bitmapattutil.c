@@ -240,12 +240,12 @@ _bitmap_create_lov_heapandindex(Relation rel,
 	 * temp relations go into the per-backend temp-toast-table namespace,
 	 * however!
 	 */
-	if (RelationIsPermanent(rel))
-		namespaceid = GetTempToastNamespace();
-	else
-		// namespaceid = 7012;
-		// namespaceid = PG_BITMAPINDEX_NAMESPACE;
+    if (RelationIsPermanent(rel))
+        // namespaceid = PG_BITMAPINDEX_NAMESPACE;
+        // namespaceid = 7012;
         namespaceid = rel->rd_rel->relnamespace;
+    else
+        namespaceid = GetTempToastNamespace();
 
 	heapid = get_relname_relid(lovHeapName, namespaceid);
 

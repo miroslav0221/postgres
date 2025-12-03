@@ -386,6 +386,9 @@ _bitmap_init(Relation indexrel, bool use_wal, bool for_empty)
 	else
 		_bitmap_create_lov_heapandindex(indexrel, &lovHeapOid, &lovIndexOid);
 
+	/* set the first item to support NULL value */
+	lovItem = _bitmap_formitem(0);
+
 	START_CRIT_SECTION();
 
 	MarkBufferDirty(metabuf);
@@ -412,7 +415,6 @@ _bitmap_init(Relation indexrel, bool use_wal, bool for_empty)
 	currLovPage = BufferGetPage(buf);
 
 	/* set the first item to support NULL value */
-	lovItem = _bitmap_formitem(0);
 	newOffset = OffsetNumberNext(PageGetMaxOffsetNumber(currLovPage));
 
 	/*
