@@ -32,6 +32,7 @@ PG_FUNCTION_INFO_V1(bmhandler);
 static void bmbuildCallback(Relation index,	ItemPointer tupleId, Datum *attdata,
 							bool *nulls, bool tupleIsAlive,	void *state);
 
+static void cleanup_pos(BMScanPosition pos);
 
 void
 bmcostestimate(struct PlannerInfo *root,
@@ -304,14 +305,6 @@ bmbeginscan(Relation rel, int nkeys, int norderbys)
     return scan;
 }
 
-/*
- * bmrescan() -- restart a scan on the bitmap index.
- */
-void
-bmrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
-         ScanKey orderbys, int norderbys)
-{
-}
 
 /*
  * bmgettuple() -- return the next tuple in a scan.
@@ -331,13 +324,6 @@ bmgetbitmap(IndexScanDesc scan, Node **bmNodeP)
     return 1;
 }
 
-/*
- * bmendscan() -- close a scan.
- */
-void
-bmendscan(IndexScanDesc scan)
-{
-}
 
 /*
  * bmmarkpos() -- save the current scan position.
@@ -353,4 +339,84 @@ bmmarkpos(IndexScanDesc scan)
 void
 bmrestrpos(IndexScanDesc scan)
 {
+}
+
+/*
+ * bmrescan() -- restart a scan on the bitmap index.
+ */
+void
+bmrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
+		 ScanKey orderbys, int norderbys)
+{
+	BMScanOpaque	so = (BMScanOpaque) scan->opaque;
+
+	if (so->bm_currPos != NULL)
+	{
+		cleanup_pos(so->bm_currPos);
+		MemSet(so->bm_currPos, 0, sizeof(BMScanPositionData));
+		so->cur_pos_valid = false;
+	}
+
+	if (so->bm_markPos != NULL)
+	{
+		cleanup_pos(so->bm_markPos);
+		MemSet(so->bm_markPos, 0, sizeof(BMScanPositionData));
+		so->cur_pos_valid = false;
+	}
+	/* reset the scan key */
+	if (scankey && scan->numberOfKeys > 0)
+		memmove(scan->keyData, scankey,
+				scan->numberOfKeys * sizeof(ScanKeyData));
+}
+
+
+/*
+ * bmendscan() -- close a scan.
+ */
+void
+bmendscan(IndexScanDesc scan)
+{
+	BMScanOpaque	so = (BMScanOpaque) scan->opaque;
+
+	/* free the space */
+	if (so->bm_currPos != NULL)
+	{
+		/*
+		 * release the buffers that have been stored for each related 
+		 * bitmap vector.
+		 */
+		cleanup_pos(so->bm_currPos);
+		pfree(so->bm_currPos);
+		so->bm_currPos = NULL;
+	}
+
+	if (so->bm_markPos != NULL)
+	{
+		cleanup_pos(so->bm_markPos);
+		pfree(so->bm_markPos);
+		so->bm_markPos = NULL;
+	}
+
+	pfree(so);
+	scan->opaque = NULL;
+}
+
+static void
+cleanup_pos(BMScanPosition pos) 
+{
+	if (pos->nvec == 0)
+		return;
+	
+	/*
+	 * Only cleanup bm_batchWords if we have more than one vector since
+	 * _bitmap_cleanup_scanpos() will clean it up for the single vector
+	 * case.
+	 */
+	if (pos->nvec > 1)
+	{
+		_bitmap_cleanup_batchwords(pos->bm_batchWords);
+		if (pos->bm_batchWords != NULL)
+			pfree(pos->bm_batchWords);
+	}
+	_bitmap_cleanup_scanpos(pos->posvecs, pos->nvec);
 }

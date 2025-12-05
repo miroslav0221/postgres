@@ -106,6 +106,49 @@ _bitmap_formitem(uint64 currTidNumber)
     return bmitem;
 }
 
+
+
+/*
+ * _bitmap_cleanup_batchwords() -- release spaces allocated for the BMBatchWords.
+ */
+void _bitmap_cleanup_batchwords(BMBatchWords* words)
+{
+	if (words == NULL)
+		return;
+
+	if (words->hwords)
+		pfree(words->hwords);
+	if (words->cwords)
+		pfree(words->cwords);
+}
+
+/*
+ * _bitmap_cleanup_scanpos() -- release space allocated for
+ * 	BMVector.
+ */
+void
+_bitmap_cleanup_scanpos(BMVector bmScanPos, uint32 numBitmapVectors)
+{
+	uint32 keyNo;
+
+	if (numBitmapVectors == 0)
+	{
+		return;
+	}
+		
+	for (keyNo=0; keyNo<numBitmapVectors; keyNo++)
+	{
+		if (BufferIsValid((bmScanPos[keyNo]).bm_lovBuffer))
+			ReleaseBuffer((bmScanPos[keyNo]).bm_lovBuffer);
+
+		_bitmap_cleanup_batchwords((bmScanPos[keyNo]).bm_batchWords);
+		if (bmScanPos[keyNo].bm_batchWords != NULL)
+			pfree((bmScanPos[keyNo]).bm_batchWords);
+	}
+
+	pfree(bmScanPos);
+}
+
 /*
  * _bitmap_log_lovitem() -- log adding a new lov item to a lov page.
  */
