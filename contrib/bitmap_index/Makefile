@@ -5,7 +5,8 @@ OBJS = \
     src/bitmappages.o \
     src/bitmapinsert.o \
     src/bitmapattutil.o \
-    src/bitmaputil.o
+    src/bitmaputil.o \
+    src/bitmapsearch.o
 
 
 EXTENSION = bitmap_index

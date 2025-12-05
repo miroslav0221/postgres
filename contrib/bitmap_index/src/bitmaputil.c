@@ -27,6 +27,79 @@
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 
+
+static void _bitmap_findnextword(BMBatchWords* words, uint64 nextReadNo);
+static void _bitmap_resetWord(BMBatchWords *words, uint32 prevStartNo);
+static uint8 _bitmap_find_bitset(BM_HRL_WORD word, uint8 lastPos);
+
+
+
+/*
+ * Fast forward to the next read position by skipping the common compressed
+ * zeros that appear in all batches. These skipped zeros are also copied into
+ * the result words.
+ */
+static uint64
+fast_forward(uint32 nbatches, BMBatchWords **batches, BMBatchWords *result)
+{
+	int i;
+	uint64 min_fill_len = MAX_FILL_LENGTH;
+	uint64 fast_forward_words = 0;
+
+	Assert(result != NULL);
+	Assert(nbatches == 0 || batches != NULL);
+
+	for (i = 0; i < nbatches; i++)
+	{
+		BM_HRL_WORD word;
+
+		/*
+		 * Fast forward the read batch from a rearrage bitmap index page.
+		 * Since words->nwordsread may get set to a new value in read_words().
+		 * See bitmapsearch.c read_words for more details.
+		 */
+		_bitmap_findnextword(batches[i], batches[i]->nextread);
+
+		word = batches[i]->cwords[batches[i]->startNo];
+
+		/* if we find a matching tid in one of the batches, nothing to do */
+		if (CUR_WORD_IS_FILL(batches[i]) && GET_FILL_BIT(word) == 1)
+			return batches[0]->nextread;
+		else if (!CUR_WORD_IS_FILL(batches[i]))
+			return batches[0]->nextread;
+		else if (CUR_WORD_IS_FILL(batches[i]) && GET_FILL_BIT(word) == 0)
+		{
+			uint64 fill_len = FILL_LENGTH(word);
+
+			/* adjust down */
+			if (fill_len < min_fill_len)
+			{
+				min_fill_len = fill_len;
+				fast_forward_words = fill_len;
+			}
+		}
+	}
+	if (fast_forward_words)
+	{
+		uint32 offset;
+		
+		for (i = 0; i < nbatches; i++)
+			batches[i]->nextread = batches[i]->nwordsread + 
+				fast_forward_words + 1;
+
+		/*
+		 * Copy these fast-forwarded words to
+		 * the result.
+		 */
+		offset = result->nwords/BM_HRL_WORD_SIZE;
+		result->hwords[offset] |= WORDNO_GET_HEADER_BIT(result->nwords);
+		result->cwords[result->nwords] = fast_forward_words;
+		result->nwords++;
+	}
+
+	return batches[0]->nextread;
+}
+
 /*
  * _bitmap_get_metapage_data() -- return the metadata info stored
  * in the given metapage buffer.
@@ -147,6 +220,533 @@ _bitmap_cleanup_scanpos(BMVector bmScanPos, uint32 numBitmapVectors)
 	}
 
 	pfree(bmScanPos);
+}
+
+/*
+ * _bitmap_reset_batchwords() -- reset the BMBatchWords for re-use.
+ */
+void
+_bitmap_reset_batchwords(BMBatchWords *words)
+{
+	words->startNo = 0;
+	words->nwords = 0;
+	MemSet(words->hwords, 0,
+		   sizeof(BM_HRL_WORD) * BM_CALC_H_WORDS(words->maxNumOfWords));
+}
+
+
+/*
+ * _bitmap_begin_iterate() -- initialize the given BMIterateResult instance.
+ */
+void
+_bitmap_begin_iterate(BMBatchWords *words, BMIterateResult *result)
+{
+	result->lastScanPos = 0;
+	result->lastScanWordNo = words->startNo;
+	result->numOfTids = 0;
+	result->nextTidLoc = 0;
+}
+
+/*
+ * _bitmap_catchup_to_next_tid - Catch up to the nextTid we need to check
+ * from last iteration, in the following cases:
+ *
+ * 1: When the concurrent insert causes bitmap items from previous full page
+ * to spill over to current page in the window when we (the read transaction)
+ * had released the lock on the previous page and not locked the current page.
+ * More details see read_words in bitmapsearch.c.
+ * Related to issue: https://github.com/greenplum-db/gpdb/issues/11308
+ * 2. Or when running bitmap heap scan path on bitmap index, since we always
+ * try to read from a table block's start tid. See pull_stream.
+ */
+void
+_bitmap_catchup_to_next_tid(BMBatchWords *words, BMIterateResult *result)
+{
+	if (words->firstTid >= result->nextTid)
+		return;
+
+	/*
+	 * Iterate each word until catch up to the next tid to search.
+	 */
+	for(; words->nwords > 0 && words->firstTid < result->nextTid;
+		result->lastScanWordNo++)
+	{
+		if (IS_FILL_WORD(words->hwords, result->lastScanWordNo))
+		{
+			BM_HRL_WORD word = words->cwords[result->lastScanWordNo];
+			uint64	fillLength = FILL_LENGTH(word);
+
+			/*
+			 * XXX: weird, why the word marks as compresed but the word is 0?
+			 */
+			if (word == 0)
+			{
+				fillLength = 1;
+				/* Skip all empty bits, this may cause words->firstTid > result->nextTid */
+				words->firstTid += fillLength * BM_HRL_WORD_SIZE;
+				words->nwords--;
+
+				/* reset next tid to skip all empty words */
+				if (words->firstTid > result->nextTid)
+					result->nextTid = words->firstTid;
+
+				continue;
+			}
+
+			if (fillLength > 0)
+			{
+				/* update fill word to reflect expansion */
+
+				uint64 fillToUse = (result->nextTid - words->firstTid) / BM_HRL_WORD_SIZE + 1;
+				if (fillToUse > fillLength)
+					fillToUse = fillLength;
+
+				words->cwords[result->lastScanWordNo] -= fillToUse;
+				words->firstTid += fillToUse * BM_HRL_WORD_SIZE;
+				fillLength -= fillToUse;
+			}
+
+			/* comsume all the fill words, try to fetch next words */
+			if (fillLength == 0)
+			{
+				words->nwords--;
+				continue;
+			}
+
+			/*
+			 * Catch up the next tid to search, but there still fill words.
+			 * Return current state.
+			 */
+			if (words->firstTid >= result->nextTid)
+				return;
+		}
+		else
+		{
+			words->firstTid += BM_HRL_WORD_SIZE;
+			words->nwords--;
+		}
+	}
+}
+/*
+ * _bitmap_findnexttids() -- find the next set of tids from a given
+ *  batch of bitmap words.
+ *
+ * The maximum number of tids to be found is defined in 'maxTids'.
+ */
+void
+_bitmap_findnexttids(BMBatchWords *words, BMIterateResult *result,
+					 uint32 maxTids)
+{
+	bool done = false;
+
+	result->nextTidLoc = result->numOfTids = 0;
+
+	/*
+	 * Only in the situation that there have concurrent read/write on two
+	 * adjacent bitmap index pages, and inserting a tid into PAGE_FULL cause expand
+	 * compressed words to new words, and rearrange those words into PAGE_NEXT,
+	 * and we ready to read a new page, we should adjust result-> lastScanWordNo
+	 * to the current position.
+	 *
+	 * The value of words->startNo will always be 0, this value will only used at
+	 * _bitmap_union to union a bunch of bitmaps, the union result will be stored
+	 * at words. result->lastScanWordNo indicates the location in words->cwords that
+	 * BMIterateResult will read the word next, it's start from 0, and will
+	 * self-incrementing during the scan. So if result->lastScanWordNo equals to
+	 * words->startNo, means we will scan a new bitmap index pages.
+	 */
+	if (result->lastScanWordNo == words->startNo &&
+			words->firstTid < result->nextTid)
+		_bitmap_catchup_to_next_tid(words, result);
+
+	while (words->nwords > 0 && result->numOfTids < maxTids && !done)
+	{
+		uint8 oldScanPos = result->lastScanPos;
+		BM_HRL_WORD word = words->cwords[result->lastScanWordNo];
+
+		/* new word, zero filled */
+		if (oldScanPos == 0 &&
+			((IS_FILL_WORD(words->hwords, result->lastScanWordNo) && 
+			  GET_FILL_BIT(word) == 0) || word == 0))
+		{
+			BM_HRL_WORD	fillLength;
+			if (word == 0)
+				fillLength = 1;
+			else
+				fillLength = FILL_LENGTH(word);
+
+			/* skip over non-matches */
+			result->nextTid += fillLength * BM_HRL_WORD_SIZE;
+			result->lastScanWordNo++;
+			words->nwords--;
+			words->firstTid += fillLength * BM_HRL_WORD_SIZE;
+			result->lastScanPos = 0;
+			continue;
+		}
+		else if (IS_FILL_WORD(words->hwords, result->lastScanWordNo)
+				 && GET_FILL_BIT(word) == 1)
+		{
+			uint64	nfillwords = FILL_LENGTH(word);
+			uint8 	bitNo;
+
+			while (result->numOfTids + BM_HRL_WORD_SIZE <= maxTids &&
+				   nfillwords > 0)
+			{
+				/* explain the fill word */
+				for (bitNo = 0; bitNo < BM_HRL_WORD_SIZE; bitNo++)
+					result->nextTids[result->numOfTids++] = result->nextTid++;
+
+				nfillwords--;
+				/* update fill word to reflect expansion */
+				words->cwords[result->lastScanWordNo]--;
+				words->firstTid += BM_HRL_WORD_SIZE;
+			}
+
+			if (nfillwords == 0)
+			{
+				result->lastScanWordNo++;
+				words->nwords--;
+				result->lastScanPos = 0;
+				continue;
+			}
+			else
+			{
+				done = true;
+				break;
+			}
+		}
+		else
+		{
+			if(oldScanPos == 0)
+				oldScanPos = BM_HRL_WORD_SIZE + 1;
+
+			while (oldScanPos != 0 && result->numOfTids < maxTids)
+			{
+				BM_HRL_WORD		w;
+
+				if (oldScanPos == BM_HRL_WORD_SIZE + 1)
+					oldScanPos = 0;
+
+				w = words->cwords[result->lastScanWordNo];
+				result->lastScanPos = _bitmap_find_bitset(w, oldScanPos);
+
+				/* did we find a bit set in this word? */
+				if (result->lastScanPos != 0)
+				{
+					uint64 tid = result->nextTid + result->lastScanPos -1;
+					result->nextTids[result->numOfTids++] = tid;
+				}
+				else
+				{
+					result->nextTid += BM_HRL_WORD_SIZE;
+					words->firstTid += BM_HRL_WORD_SIZE;
+					/* start scanning a new word */
+					words->nwords--;
+					result->lastScanWordNo++;
+					result->lastScanPos = 0;
+				}
+				oldScanPos = result->lastScanPos;
+			}
+		}
+	}
+}
+
+/*
+ * _bitmap_union() -- union 'numBatches' bitmaps
+ *
+ * All bitmap words are HRL compressed. The result bitmap words are also
+ * HRL compressed, except that fill unset words may be lossily compressed.
+ */
+void
+_bitmap_union(BMBatchWords **batches, uint32 numBatches, BMBatchWords *result)
+{
+	bool 		done = false;
+	uint32 	   *prevstarts;
+	uint64		nextReadNo;
+	uint64		batchNo;
+
+	Assert ((int)numBatches >= 0);
+
+	if (numBatches == 0)
+		return;
+
+	/* save batch->startNo for each input bitmap vector */
+	prevstarts = (uint32 *)palloc0(numBatches * sizeof(uint32));
+
+	/*
+	 * Update the real firstTid for the bachwords with unioned batches.
+	 * This is required because we may result->firstTid is set to nextTid
+	 * to fetch in _bitmap_nextbatchwords for bitmap index scan, but the
+	 * read words may not reach this position yet, the below calculation
+	 * will set it back to the real first tid of current result batch.
+	 */
+	result->firstTid = ((batches[0]->nextread - 1) * BM_HRL_WORD_SIZE) + 1;
+
+	/* 
+	 * Compute the next read offset. We fast forward compressed
+	 * zero words when possible.
+	 */
+	nextReadNo = fast_forward(numBatches, batches, result);
+
+	while (!done &&	result->nwords < result->maxNumOfWords)
+	{
+		BM_HRL_WORD orWord = LITERAL_ALL_ZERO;
+		BM_HRL_WORD	word;
+		bool		orWordIsLiteral = true;
+
+		for (batchNo = 0; batchNo < numBatches; batchNo++)
+		{
+			BMBatchWords *bch = batches[batchNo];
+
+			/* skip nextReadNo - nwordsread - 1 words */
+			_bitmap_findnextword(bch, nextReadNo);
+
+			if (bch->nwords == 0)
+			{
+				done = true;
+				break;
+			}
+
+			Assert(bch->nwordsread == nextReadNo - 1);
+
+			/* Here, startNo should point to the word to be read. */
+			word = bch->cwords[bch->startNo];
+
+			if (CUR_WORD_IS_FILL(bch) && GET_FILL_BIT(word) == 1)
+			{
+				/* Fill word represents matches */
+				bch->nwordsread += FILL_LENGTH(word);
+				orWord = BM_MAKE_FILL_WORD(1, bch->nwordsread - nextReadNo + 1);
+				orWordIsLiteral = false;
+
+				nextReadNo = bch->nwordsread + 1;
+				bch->startNo++;
+				bch->nwords--;
+				break;
+			}
+			else if (CUR_WORD_IS_FILL(bch) && GET_FILL_BIT(word) == 0)
+			{
+				/* Fill word represents no matches */
+
+				bch->nwordsread++;
+				prevstarts[batchNo] = bch->startNo;
+				if (FILL_LENGTH(word) == 1)
+				{
+					bch->startNo++;
+					bch->nwords--;
+				}
+				else
+					bch->cwords[bch->startNo]--;
+				orWordIsLiteral = true;
+			}
+			else if (!CUR_WORD_IS_FILL(bch))
+			{
+				/* word is literal */
+				prevstarts[batchNo] = bch->startNo;
+				orWord |= word;
+				bch->nwordsread++;
+				bch->startNo++;
+				bch->nwords--;
+				orWordIsLiteral = true;
+			}
+		}
+
+		if (done)
+		{
+			uint32 i;
+
+			/* reset the attributes before batchNo */
+			for (i = 0; i < batchNo; i++)
+				_bitmap_resetWord(batches[i], prevstarts[i]);
+			break;
+		}
+		else
+		{
+			if (!orWordIsLiteral)
+			{
+				 /* Word is not literal, update the result header */
+				uint32 	offs = result->nwords/BM_HRL_WORD_SIZE;
+				uint32	n = result->nwords;
+				result->hwords[offs] |= WORDNO_GET_HEADER_BIT(n);
+			}
+			result->cwords[result->nwords] = orWord;
+			result->nwords++;
+		}
+
+		if (orWordIsLiteral)
+			nextReadNo++;
+
+		/* we just processed the last batch and it was empty */
+		if (batchNo == numBatches - 1 && batches[batchNo]->nwords == 0)
+			done = true;
+	}
+
+	/* set the next word to read for all input vectors */
+	for (batchNo = 0; batchNo < numBatches; batchNo++)
+		batches[batchNo]->nextread = nextReadNo;
+
+	pfree(prevstarts);
+}
+
+
+/*
+ * _bitmap_findnexttid() -- find the next tid location in a given batch
+ *  of bitmap words.
+ */
+uint64
+_bitmap_findnexttid(BMBatchWords *words, BMIterateResult *result)
+{
+	/*
+	 * If there is not tids from previous computation, then we
+	 * try to find next set of tids.
+	 */
+
+	if (result->nextTidLoc >= result->numOfTids)
+		_bitmap_findnexttids(words, result, BM_BATCH_TIDS);
+
+	/* if find more tids, then return the first one */
+	if (result->nextTidLoc < result->numOfTids)
+	{
+		result->nextTidLoc++;
+		return (result->nextTids[result->nextTidLoc-1]);
+	}
+
+	/* no more tids */
+	return 0;
+}
+
+
+
+/*
+ * _bitmap_find_bitset() -- find the rightmost set bit (bit=1) in the 
+ * 		given word since 'lastPos', not including 'lastPos'.
+ *
+ * The rightmost bit in the given word is considered the position 1, and
+ * the leftmost bit is considered the position BM_HRL_WORD_SIZE.
+ *
+ * If such set bit does not exist in this word, 0 is returned.
+ */
+static uint8
+_bitmap_find_bitset(BM_HRL_WORD word, uint8 lastPos)
+{
+	uint8 pos = lastPos + 1;
+	BM_HRL_WORD	rightmostBitWord;
+
+	if (pos > BM_HRL_WORD_SIZE)
+	  return 0;
+
+	rightmostBitWord = (((BM_HRL_WORD)1) << (pos-1));
+
+	while (pos <= BM_HRL_WORD_SIZE && (word & rightmostBitWord) == 0)
+	{
+		rightmostBitWord <<= 1;
+		pos++;
+	}
+
+	if (pos > BM_HRL_WORD_SIZE)
+		pos = 0;
+
+	return pos;
+}
+
+/*
+ * _bitmap_findnextword() -- Find the next word whose position is
+ *        	                'nextReadNo' in an uncompressed format.
+ */
+static void
+_bitmap_findnextword(BMBatchWords *words, uint64 nextReadNo)
+{
+	/* 
+     * 'words->nwordsread' defines how many un-compressed words
+     * have been read in this bitmap. We read from
+     * position 'startNo', and increment 'words->nwordsread'
+     * differently based on the type of words that are read, until
+     * 'words->nwordsread' is equal to 'nextReadNo'.
+     */
+	while (words->nwords > 0 && words->nwordsread < nextReadNo - 1)
+	{
+		/* Get the current word */
+		BM_HRL_WORD word = words->cwords[words->startNo];
+
+		if (CUR_WORD_IS_FILL(words))
+		{
+			if(FILL_LENGTH(word) <= (nextReadNo - words->nwordsread - 1))
+			{
+				words->nwordsread += FILL_LENGTH(word);
+				words->startNo++;
+				words->nwords--;
+			}
+			else
+			{
+				words->cwords[words->startNo] -= (nextReadNo - words->nwordsread - 1);
+				words->nwordsread = nextReadNo - 1;
+			}
+		}
+		else
+		{
+			words->nwordsread++;
+			words->startNo++;
+			words->nwords--;
+		}
+	}
+}
+
+/*
+ * _bitmap_resetWord() -- Reset the read position in an BMBatchWords
+ *       	              to its previous value.
+ *
+ * Reset the read position in an BMBatchWords to its previous value,
+ * which is given in 'prevStartNo'. Based on different type of words read,
+ * the actual bitmap word may need to be changed.
+ */
+static void
+_bitmap_resetWord(BMBatchWords *words, uint32 prevStartNo)
+{
+	if (words->startNo > prevStartNo)
+	{
+		Assert(words->startNo == prevStartNo + 1);
+		words->startNo = prevStartNo;
+		words->nwords++;
+	}
+	else
+	{
+		Assert(words->startNo == prevStartNo);
+		Assert(CUR_WORD_IS_FILL(words));
+		words->cwords[words->startNo]++;
+	}
+	words->nwordsread--;
+}
+
+/*
+ * _bitmap_init_batchwords() -- initialize a BMBatchWords in a given
+ * memory context.
+ *
+ * Allocate spaces for bitmap header words and bitmap content words.
+ */
+void
+_bitmap_init_batchwords(BMBatchWords* words,
+						uint32 maxNumOfWords,
+						MemoryContext mcxt)
+{
+	uint32	numOfHeaderWords;
+	MemoryContext oldcxt;
+
+	words->nwordsread = 0;
+	words->nextread = 1;
+	words->startNo = 0;
+	words->nwords = 0;
+
+	numOfHeaderWords = BM_CALC_H_WORDS(maxNumOfWords);
+
+	words->maxNumOfWords = maxNumOfWords;
+
+	/* Make sure that we have at least one page of words */
+	Assert(words->maxNumOfWords >= BM_NUM_OF_HRL_WORDS_PER_PAGE);
+
+	oldcxt = MemoryContextSwitchTo(mcxt);
+	words->hwords = palloc0(sizeof(BM_HRL_WORD)*numOfHeaderWords);
+	words->cwords = palloc0(sizeof(BM_HRL_WORD)*words->maxNumOfWords);
+	MemoryContextSwitchTo(oldcxt);
 }
 
 /*

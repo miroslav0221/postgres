@@ -75,19 +75,19 @@ bmhandler(PG_FUNCTION_ARGS)
 	amroutine->ambuild = bmbuild;
 	amroutine->ambuildempty = bmbuildempty;
 	amroutine->aminsert = bminsert;
-	amroutine->ambulkdelete = bmbulkdelete;
+	amroutine->ambulkdelete = bmbulkdelete; //
 	amroutine->amvacuumcleanup = bmvacuumcleanup;
 	amroutine->amcanreturn = NULL;
-	amroutine->amcostestimate = bmcostestimate;
-	amroutine->amoptions = bmoptions;
+	amroutine->amcostestimate = bmcostestimate; //
+	amroutine->amoptions = bmoptions; //
 	amroutine->amproperty = NULL;
-	amroutine->amvalidate = bmvalidate;
+	amroutine->amvalidate = bmvalidate; //
 	amroutine->ambeginscan = bmbeginscan;
 	amroutine->amrescan = bmrescan;
-	amroutine->amgettuple = bmgettuple;
-	amroutine->amgetbitmap = bmgetbitmap;
-	amroutine->amendscan = bmendscan;
-	amroutine->ammarkpos = bmmarkpos;
+	amroutine->amgettuple = bmgettuple; 
+	amroutine->amgetbitmap = bmgetbitmap; //
+	amroutine->amendscan = bmendscan; 
+	amroutine->ammarkpos = bmmarkpos; //
 	amroutine->amrestrpos = bmrestrpos;
 
 	PG_RETURN_POINTER(amroutine);
@@ -306,17 +306,35 @@ bmbeginscan(Relation rel, int nkeys, int norderbys)
 }
 
 
+
 /*
  * bmgettuple() -- return the next tuple in a scan.
  */
 bool
 bmgettuple(IndexScanDesc scan, ScanDirection dir)
 {
-    return true;
+	BMScanOpaque  so = (BMScanOpaque) scan->opaque;
+	bool		res;
+
+	/* This implementation of a bitmap index is never lossy */
+	scan->xs_recheck = false;
+
+	/* 
+	 * If we have already begun our scan, continue in the same direction.
+	 * Otherwise, start up the scan.
+	 */
+	if (so->bm_currPos && so->cur_pos_valid)
+		res = _bitmap_next(scan, dir);
+	else
+		res = _bitmap_first(scan, dir);
+
+	return res;
 }
+	
 
 /*
  * bmgetbitmap() -- return a stream bitmap.
+ 
  */
 int64
 bmgetbitmap(IndexScanDesc scan, Node **bmNodeP)
