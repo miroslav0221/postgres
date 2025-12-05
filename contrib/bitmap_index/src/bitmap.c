@@ -75,20 +75,20 @@ bmhandler(PG_FUNCTION_ARGS)
 	amroutine->ambuild = bmbuild;
 	amroutine->ambuildempty = bmbuildempty;
 	amroutine->aminsert = bminsert;
-	 amroutine->ambulkdelete = bmbulkdelete;
-	 amroutine->amvacuumcleanup = bmvacuumcleanup;
+	amroutine->ambulkdelete = bmbulkdelete;
+	amroutine->amvacuumcleanup = bmvacuumcleanup;
 	amroutine->amcanreturn = NULL;
-	 amroutine->amcostestimate = bmcostestimate;
-	 amroutine->amoptions = bmoptions;
+	amroutine->amcostestimate = bmcostestimate;
+	amroutine->amoptions = bmoptions;
 	amroutine->amproperty = NULL;
-	 amroutine->amvalidate = bmvalidate;
-	 amroutine->ambeginscan = bmbeginscan;
-	 amroutine->amrescan = bmrescan;
-	 amroutine->amgettuple = bmgettuple;
-	 amroutine->amgetbitmap = bmgetbitmap;
-	 amroutine->amendscan = bmendscan;
-	 amroutine->ammarkpos = bmmarkpos;
-	 amroutine->amrestrpos = bmrestrpos;
+	amroutine->amvalidate = bmvalidate;
+	amroutine->ambeginscan = bmbeginscan;
+	amroutine->amrescan = bmrescan;
+	amroutine->amgettuple = bmgettuple;
+	amroutine->amgetbitmap = bmgetbitmap;
+	amroutine->amendscan = bmendscan;
+	amroutine->ammarkpos = bmmarkpos;
+	amroutine->amrestrpos = bmrestrpos;
 
 	PG_RETURN_POINTER(amroutine);
 }
