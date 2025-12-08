@@ -75,7 +75,7 @@ bmhandler(PG_FUNCTION_ARGS)
 	amroutine->ambuild = bmbuild;
 	amroutine->ambuildempty = bmbuildempty;
 	amroutine->aminsert = bminsert;
-	amroutine->ambulkdelete = bmbulkdelete; //
+	amroutine->ambulkdelete = bmbulkdelete;
 	amroutine->amvacuumcleanup = bmvacuumcleanup;
 	amroutine->amcanreturn = NULL;
 	amroutine->amcostestimate = bmcostestimate; //
@@ -251,6 +251,23 @@ bmbulkdelete(IndexVacuumInfo *info,
              IndexBulkDeleteCallback callback,
              void *callback_state)
 {
+    Relation	rel = info->index;
+    ReindexParams reindex_params = {0};
+
+    /* allocate stats if first time through, else re-use existing struct */
+    if (stats == NULL)
+        stats = (IndexBulkDeleteResult *)
+                palloc0(sizeof(IndexBulkDeleteResult));
+
+    reindex_index(NULL, RelationGetRelid(rel), true, rel->rd_rel->relpersistence, &reindex_params);
+
+    CommandCounterIncrement();
+
+    stats->num_pages = RelationGetNumberOfBlocks(rel);
+    /* Since we re-build the index, set this to number of heap tuples. */
+    stats->num_index_tuples = info->num_heap_tuples;
+    stats->tuples_removed = 0;
+
     return stats;
 }
 
