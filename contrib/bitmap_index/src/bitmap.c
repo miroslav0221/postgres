@@ -24,6 +24,8 @@
 #include "utils/memutils.h"
 #include "utils/index_selfuncs.h"
 #include "utils/syscache.h"
+#include "utils/selfuncs.h"
+#include "parser/parsetree.h"
 
 PG_MODULE_MAGIC;
 
@@ -44,6 +46,61 @@ bmcostestimate(struct PlannerInfo *root,
                double *indexCorrelation,
                double *indexPages)
 {
+    IndexOptInfo *index = path->indexinfo;
+    RelOptInfo *baserel = index->rel;
+    RangeTblEntry *rte PG_USED_FOR_ASSERTS_ONLY = planner_rt_fetch(baserel->relid, root);
+    GenericCosts costs;
+
+    Assert(rte->rtekind == RTE_RELATION);
+    Assert(rte->relid != InvalidOid);
+
+    /*
+     * Now do generic index cost estimation.
+     */
+    MemSet(&costs, 0, sizeof(costs));
+
+    /*
+     * We create a LOV for each distinct key in bitmap index. And the LOV point
+     * to the bitmap vector pages. Since each bitmap vector has the same length,
+     * although we do compress for the bits, but we can assume each distinct
+     * key has approximately same number of bitmap vector pages(although there
+     * must be some counterexamples). So the indexPages should be:
+     * selectedDistinctValues / numDistinctValues * index->pages.
+     *
+     * But the issue is we can't estimate both of the distinct values from stats
+     * through estimate_num_groups since it produces larger estimates. Especially
+     * for selectedDistinctValues.
+     *
+     * Image below cases:
+     * 1. indexSelectivity also correspond to how may distinct values get selected.
+     * Then the result of genericcostestimate's indexPages will be accurate.
+     * 2. indexSelectivity is high but only match a small number of distinct values.
+     * This means the bitmap vector is sparse. So the total index pages number should
+     * be small.
+     * 3. indexSelectivity is low but match lots of distinct values. This also means
+     * the bitmap vector is sparse, and the total index pages number should be small.
+     *
+     * The estimate in genericcostestimate should works fine for above cases although
+     * it's not accurate.
+     */
+
+    genericcostestimate(root, path, loop_count, &costs);
+
+    *indexStartupCost = costs.indexStartupCost;
+    *indexTotalCost = costs.indexTotalCost;
+#ifdef FAULT_INJECTOR
+    /* Simulate an bitmapAnd plan by changing bitmap cost. */
+		if (FaultInjector_InjectFaultIfSet("simulate_bitmap_and",
+									DDLNotSpecified,
+									"",
+									"") == FaultInjectorTypeSkip)
+		{
+			*indexTotalCost = 0;
+		}
+#endif
+    *indexSelectivity = costs.indexSelectivity;
+    *indexCorrelation = costs.indexCorrelation;
+    *indexPages = costs.numIndexPages;
 }
 
 /*
